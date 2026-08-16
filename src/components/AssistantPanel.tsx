@@ -256,6 +256,7 @@ export default function AssistantPanel() {
         source.connect(audioCtx.destination)
         source.onended = onDone
         assistSourceRef.current = source
+        if (audioCtx.state !== 'running') await audioCtx.resume()
         source.start(0)
       } else {
         // Desktop fallback (no AudioContext) — new Audio() works without gesture there

@@ -69,6 +69,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
   const streamRef          = useRef<MediaStream | null>(null)
   const audioCtxRef        = useRef<AudioContext | null>(null)
+  const keepaliveRef       = useRef<AudioBufferSourceNode | null>(null)
   const analyserRef        = useRef<AnalyserNode | null>(null)
   const recorderRef        = useRef<MediaRecorder | null>(null)
   const chunksRef          = useRef<Blob[]>([])
@@ -306,6 +307,21 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     const ctx     = new AudioContext()
     audioCtxRef.current = ctx
     if (ctx.state === 'suspended') await ctx.resume()
+
+    // iOS auto-suspends AudioContext when there is no audio output.
+    // A silent looping buffer keeps the context in "running" state so that
+    // AudioBufferSourceNode.start() works later without a new user gesture.
+    const keepaliveBuf = ctx.createBuffer(1, 1024, ctx.sampleRate)
+    const keepaliveSrc = ctx.createBufferSource()
+    keepaliveSrc.buffer = keepaliveBuf
+    keepaliveSrc.loop = true
+    const silentGain = ctx.createGain()
+    silentGain.gain.value = 0
+    keepaliveSrc.connect(silentGain)
+    silentGain.connect(ctx.destination)
+    keepaliveSrc.start(0)
+    keepaliveRef.current = keepaliveSrc
+
     const src     = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 512
@@ -330,6 +346,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     }
     finishRecording()
 
+    if (keepaliveRef.current) { try { keepaliveRef.current.stop() } catch { /* ignore */ }; keepaliveRef.current = null }
     if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
     if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null }
     analyserRef.current   = null
@@ -359,6 +376,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     return () => {
       vadActiveRef.current = false
+      if (keepaliveRef.current) { try { keepaliveRef.current.stop() } catch { /* ignore */ } }
       if (streamRef.current)   streamRef.current.getTracks().forEach(t => t.stop())
       if (audioCtxRef.current) audioCtxRef.current.close()
     }
