@@ -3,12 +3,19 @@
 import { useEffect, useRef, useState } from 'react'
 import type { LessonImage } from '@/types/db'
 
-// Strips LaTeX blocks, ## headings and **bold** markers for TTS narration
-export function stripLatex(text: string): string {
+// Готовит текст части к озвучке: убирает LaTeX, разметку заголовков и **жирный**.
+//
+// Заголовки получают точку и пустую строку после себя. Синтезатор не видит
+// форматирования — без пунктуации он читает заголовок слитно со следующим
+// абзацем, одной фразой. Точка даёт паузу, пустая строка — ещё чуть большую.
+// Правка живёт здесь, а не в тексте занятия: на экране заголовки остаются
+// без точек, и уже сгенерированные занятия ничего не нужно переделывать.
+export function prepareForSpeech(text: string): string {
   return text
     .replace(/\$\$[\s\S]+?\$\$/g, '')   // display math $$...$$
     .replace(/\$[^$\n]+\$/g, '')          // inline math $...$
-    .replace(/^##\s+/gm, '')
+    .replace(/^#{1,6}\s+(.+?)\s*$/gm, (_m, title: string) =>
+      /[.!?:;…]$/.test(title) ? `${title}\n` : `${title}.\n`)
     .replace(/\*\*/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()

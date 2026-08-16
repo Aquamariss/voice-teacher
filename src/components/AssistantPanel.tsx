@@ -219,8 +219,14 @@ export default function AssistantPanel() {
     }
   }
 
-  async function playAssistantTTS(text: string) {
-    if (!voice.isActive) return
+  // onComplete вызывается ровно один раз на любом исходе — в том числе при
+  // ошибке сети и отказе воспроизведения. От него зависит возобновление
+  // лекции после подтверждения, поэтому потерять его нельзя.
+  async function playAssistantTTS(text: string, onComplete?: () => void) {
+    let completed = false
+    const complete = () => { if (!completed) { completed = true; onComplete?.() } }
+
+    if (!voice.isActive) { complete(); return }
     stopAssistantAudio()
     voice.setBusy(true)
     voice.setVoiceStatus('speaking')
@@ -235,13 +241,14 @@ export default function AssistantPanel() {
         const body = await res.text().catch(() => '')
         verr(`tts: HTTP ${res.status}`, body.slice(0, 200))
         voice.setBusy(false)
+        complete()
         return
       }
-      if (!voice.isActive) { voice.setBusy(false); return }
+      if (!voice.isActive) { voice.setBusy(false); complete(); return }
 
       const blob = await res.blob()
       vlog(`tts: получено ${blob.size} байт, ${blob.type}`)
-      if (!voice.isActive) { voice.setBusy(false); return }
+      if (!voice.isActive) { voice.setBusy(false); complete(); return }
 
       const url = URL.createObjectURL(blob)
       ttsBlobUrlRef.current = url
@@ -255,6 +262,7 @@ export default function AssistantPanel() {
         if (ttsBlobUrlRef.current) { URL.revokeObjectURL(ttsBlobUrlRef.current); ttsBlobUrlRef.current = null }
         assistAudioRef.current = null
         voice.setBusy(false)
+        complete()
       }
       audio.onended = onDone
       audio.onerror = () => {
@@ -278,6 +286,7 @@ export default function AssistantPanel() {
     } catch (e) {
       verr('tts: исключение', e)
       voice.setBusy(false)
+      complete()
     }
   }
 
@@ -286,6 +295,19 @@ export default function AssistantPanel() {
     window.addEventListener('voice:interrupt-audio', handle)
     return () => window.removeEventListener('voice:interrupt-audio', handle)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Подтверждение команды «продолжай»: сначала фраза голосом, затем лекция.
+  // Порядок важен — иначе подтверждение звучало бы поверх лекции.
+  useEffect(() => {
+    const handle = (e: Event) => {
+      const { text } = (e as CustomEvent<{ text: string }>).detail
+      const resume = () => window.dispatchEvent(new CustomEvent('voice:resume-lecture'))
+      if (!voice.isActive) { resume(); return }
+      playAssistantTTS(text, resume)
+    }
+    window.addEventListener('voice:say-and-resume', handle)
+    return () => window.removeEventListener('voice:say-and-resume', handle)
+  }, [voice]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Голосовая команда скорости — применяем к текущему аудио ассистента
   useEffect(() => {

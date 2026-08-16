@@ -8,7 +8,7 @@ import {
   type QuizData, type QuizLevel1Question, type QuizLevel2Question, type QuizResults,
 } from '@/types/db'
 import AudioPlayer from '@/components/AudioPlayer'
-import PartContent, { stripLatex } from '@/components/PartContent'
+import PartContent, { prepareForSpeech } from '@/components/PartContent'
 
 // ─── Типы ────────────────────────────────────────────────────────────────────
 
@@ -1026,7 +1026,7 @@ export default function TopicClient({
           <AudioPlayer
             title={lesson.name}
             partLabel={partLabel}
-            text={stripLatex(part.content)}
+            text={prepareForSpeech(part.content)}
             onClose={() => setPlayingPart(null)}
             onEnded={() => {
               if (hasNext) {

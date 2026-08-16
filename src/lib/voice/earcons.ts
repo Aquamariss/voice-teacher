@@ -10,10 +10,13 @@
 
 const EARCONS_KEY = 'voice-earcons'
 
+// Локальная копия типа, чтобы не тянуть импорт из VoiceContext — он сам
+// импортирует этот модуль, и получился бы цикл
+type Status = 'idle' | 'listening' | 'recording' | 'transcribing' | 'processing' | 'speaking'
+
 let el: HTMLAudioElement | null = null
-let startUri  = ''
-let endUri    = ''
 let silentUri = ''
+const byStatus: Partial<Record<Status, string>> = {}
 
 function encodeWav(samples: Float32Array, sampleRate: number): string {
   const len  = samples.length
@@ -68,17 +71,25 @@ function tone(fromHz: number, toHz: number, durMs: number, amp = 0.16): string {
   return encodeWav(out, sampleRate)
 }
 
+// Своя метка на каждое состояние: слушая в кармане, только по звуку и можно
+// понять, на каком этапе система. Восходящие тоны — «принял, работаю»,
+// нисходящие — «закончил, жду».
 function ensureBuilt() {
   if (typeof window === 'undefined') return
   if (!el) {
     el = new Audio()
     el.preload = 'auto'
   }
-  if (!startUri) {
-    startUri  = tone(660, 880, 110)   // восходящий — «слушаю»
-    endUri    = tone(880, 520, 150)   // нисходящий — «понял, думаю»
-    silentUri = tone(440, 440, 40, 0) // беззвучный, только для разблокировки
-  }
+  if (silentUri) return
+
+  byStatus.listening    = tone(700, 700,  90, 0.10)  // ровный — «готов слушать»
+  byStatus.recording    = tone(660, 880, 110, 0.16)  // восходящий — «записываю»
+  byStatus.transcribing = tone(880, 520, 150, 0.14)  // нисходящий — «понял, помолчи»
+  byStatus.processing   = tone(380, 380, 130, 0.11)  // низкий ровный — «думаю»
+  byStatus.speaking     = tone(520, 720, 120, 0.11)  // мягкий восходящий — «отвечаю»
+  byStatus.idle         = tone(660, 300, 180, 0.13)  // длинный вниз — «выключен»
+
+  silentUri = tone(440, 440, 40, 0)                  // только для разблокировки
 }
 
 export function earconsEnabled(): boolean {
@@ -99,13 +110,11 @@ export function unlockEarcons() {
   el.play().catch(() => { /* разблокировка не критична */ })
 }
 
-function play(uri: string) {
+export function earconFor(status: Status) {
   if (!earconsEnabled()) return
   ensureBuilt()
-  if (!el) return
+  const uri = byStatus[status]
+  if (!el || !uri) return
   el.src = uri
   el.play().catch(() => { /* звук-подсказка, молча пропускаем */ })
 }
-
-export const earconStart = () => play(startUri)
-export const earconEnd   = () => play(endUri)

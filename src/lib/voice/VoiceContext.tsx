@@ -5,7 +5,7 @@ import {
   useEffect, useCallback, type ReactNode,
 } from 'react'
 import { vlog, vwarn, verr, logEnvironment } from './debugLog'
-import { unlockEarcons, earconStart, earconEnd } from './earcons'
+import { unlockEarcons, earconFor } from './earcons'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -57,7 +57,12 @@ const SILENT_WAV =
 // Слова-команды для управления лекцией.
 // Используем tokenMatchesAny() — точное совпадение токена, не includes()
 const STOP_WORDS    = ['стоп', 'пауза', 'остановись', 'стоп-лекция']
-const RESUME_WORDS  = ['продолжи', 'продолжим', 'продолжить', 'продолжите', 'дальше', 'вперёд', 'вперед']
+// Возобновление проверяем регуляркой по формам глагола, а не списком слов:
+// Whisper возвращает то «продолжи», то «продолжай», то «продолжаю».
+// Именно из-за жёсткого списка команда «продолжаю занятие» уходила ассистенту
+// как обычный вопрос. Перечисление окончаний, а не основа «продолж», —
+// чтобы «продолжительность» не считалась командой.
+const RESUME_RE = /^(продолж(и|им|ими|ить|ите|ай|айте|аю|аем)|дальше|вперёд|вперед|поехали)$/
 const SLOWER_WORDS  = ['помедленнее', 'медленнее', 'помедленней', 'медленней', 'потише', 'медленно']
 const FASTER_WORDS  = ['побыстрее', 'быстрее', 'побыстрей', 'ускорь', 'ускори', 'побыстрее']
 
@@ -65,12 +70,20 @@ const AUTO_ENABLE_KEY = 'voice-auto-enable'
 
 // Разбиваем текст по пробелам/знакам препинания и проверяем точное совпадение токена.
 // Это предотвращает ложные срабатывания: "продолжительность" НЕ содержит "продолжи" как слово.
-function tokenMatchesAny(text: string, words: string[]): boolean {
-  const tokens = text
+function tokenize(text: string): string[] {
+  return text
     .split(/[\s,.!?;:–—()]+/)
     .map(t => t.toLowerCase().replace(/[^а-яёa-z0-9]/g, ''))
     .filter(Boolean)
+}
+
+function tokenMatchesAny(text: string, words: string[]): boolean {
+  const tokens = tokenize(text)
   return words.some(w => tokens.includes(w))
+}
+
+function tokenMatchesRe(text: string, re: RegExp): boolean {
+  return tokenize(text).some(t => re.test(t))
 }
 
 // Расширение файла по MIME — Whisper определяет формат именно по имени файла
@@ -138,10 +151,14 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => { logEnvironment() }, [])
 
-  // Статус нужен и синхронно (в цикле VAD), поэтому дублируем его в ref
+  // Статус нужен и синхронно (в цикле VAD), поэтому дублируем его в ref.
+  // Здесь же единственная точка, где звучат метки — так ни один переход
+  // не окажется беззвучным и ни один не прозвучит дважды.
   const setVoiceStatus = useCallback((s: VoiceStatus) => {
+    if (voiceStatusRef.current === s) return
     voiceStatusRef.current = s
     setVoiceStatusState(s)
+    earconFor(s)
   }, [])
 
   // ── Слушаем состояние AudioPlayer ─────────────────────────────────────────
@@ -149,13 +166,22 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const onPlay  = () => { isLecturePlayingRef.current = true }
     const onPause = () => { isLecturePlayingRef.current = false }
+    // Лекция возобновилась — даём ей секунду разогнаться, чтобы первые такты
+    // не попали в запись как «речь пользователя»
+    const onResume = () => {
+      busyRef.current = false
+      if (isActiveRef.current) setVoiceStatus('listening')
+      restartVADAfter(1000)
+    }
     window.addEventListener('voice:lecture-playing', onPlay)
     window.addEventListener('voice:lecture-paused',  onPause)
+    window.addEventListener('voice:resume-lecture',  onResume)
     return () => {
       window.removeEventListener('voice:lecture-playing', onPlay)
       window.removeEventListener('voice:lecture-paused',  onPause)
+      window.removeEventListener('voice:resume-lecture',  onResume)
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── setBusy ───────────────────────────────────────────────────────────────
 
@@ -361,7 +387,6 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     chunksRef.current      = []
     recordStartRef.current = Date.now()
     setVoiceStatus('recording')
-    earconStart()
 
     const mimeType = recorderMimeRef.current
 
@@ -394,9 +419,6 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         if (isActiveRef.current) setVoiceStatus('listening')
         return
       }
-      // «Понял, помолчи» — единственный сигнал, который слышен, когда
-      // телефон в кармане и экран не виден
-      earconEnd()
       sendToWhisper(blob, extFromMime(actualMime))
     }
 
@@ -472,14 +494,15 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
       // ── РЕЖИМ ДИАЛОГА (лекция на паузе или не запущена) ─────────────────
 
-      // Команда «продолжи» — возобновляем лекцию, ассистента не трогаем
-      if (tokenMatchesAny(normalized, RESUME_WORDS)) {
+      // Команда «продолжи» — возобновляем лекцию, ассистента не трогаем.
+      // Сначала короткое голосовое подтверждение: без него на слух непонятно,
+      // вернулась лекция или ассистент всё ещё отвечает на вопрос.
+      // busyRef остаётся true — его снимет TTS подтверждения.
+      if (tokenMatchesRe(normalized, RESUME_RE)) {
         vlog('cmd: продолжить лекцию')
-        window.dispatchEvent(new CustomEvent('voice:resume-lecture'))
-        busyRef.current = false
-        if (isActiveRef.current) setVoiceStatus('listening')
-        // Даём 1 сек чтобы эхо лекции не попало в следующую запись
-        restartVADAfter(1000)
+        window.dispatchEvent(new CustomEvent('voice:say-and-resume', {
+          detail: { text: 'Хорошо, продолжаю лекцию.' },
+        }))
         return
       }
 
