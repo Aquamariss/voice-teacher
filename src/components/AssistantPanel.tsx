@@ -7,6 +7,7 @@ import { type AgentStructure, type Discipline, type Topic } from '@/types/db'
 import { SPEEDS, SPEED_KEY, getSavedSpeed } from '@/lib/playback-speed'
 import { PartText } from '@/components/PartContent'
 import { getVoiceId } from '@/lib/voice/voiceSettings'
+import { vlog, verr } from '@/lib/voice/debugLog'
 import WikiCarousel, { type WikiImage } from '@/components/WikiCarousel'
 
 type Role       = 'user' | 'assistant'
@@ -119,7 +120,6 @@ export default function AssistantPanel() {
   const topicCtxRef        = useRef<TopicStructureCtx | null>(null)
   const modeRef        = useRef<PanelMode>('assistant')
   const assistAudioRef  = useRef<HTMLAudioElement | null>(null)
-  const assistSourceRef = useRef<AudioBufferSourceNode | null>(null)
   const ttsBlobUrlRef   = useRef<string | null>(null)
   // Tracks the currently viewed lesson (for quiz context)
   const activeLessonIdRef = useRef<string | null>(null)
@@ -204,15 +204,13 @@ export default function AssistantPanel() {
   // ── TTS ───────────────────────────────────────────────────────────────────────
 
   function stopAssistantAudio() {
-    if (assistSourceRef.current) {
-      try { assistSourceRef.current.stop() } catch { /* already stopped */ }
-      assistSourceRef.current.onended = null
-      assistSourceRef.current = null
-    }
-    if (assistAudioRef.current) {
-      assistAudioRef.current.onended = null
-      assistAudioRef.current.onerror = null
-      assistAudioRef.current.pause()
+    const audio = assistAudioRef.current
+    if (audio) {
+      audio.onended = null
+      audio.onerror = null
+      audio.pause()
+      // src НЕ очищаем: элемент переиспользуется и очистка сбрасывает
+      // разблокировку автовоспроизведения на iOS
       assistAudioRef.current = null
     }
     if (ttsBlobUrlRef.current) {
@@ -227,51 +225,60 @@ export default function AssistantPanel() {
     voice.setBusy(true)
     voice.setVoiceStatus('speaking')
 
-    const audioCtx = voice.getAudioCtx()
-
     try {
+      vlog(`tts: запрос, ${text.length} символов`)
       const res = await fetch('/api/tts', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, voiceId: getVoiceId() }),
       })
-      if (!res.ok || !voice.isActive) { voice.setBusy(false); return }
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        verr(`tts: HTTP ${res.status}`, body.slice(0, 200))
+        voice.setBusy(false)
+        return
+      }
+      if (!voice.isActive) { voice.setBusy(false); return }
+
+      const blob = await res.blob()
+      vlog(`tts: получено ${blob.size} байт, ${blob.type}`)
+      if (!voice.isActive) { voice.setBusy(false); return }
+
+      const url = URL.createObjectURL(blob)
+      ttsBlobUrlRef.current = url
+
+      // Переиспользуем элемент, разблокированный жестом при включении микрофона:
+      // на iOS play() из async-кода разрешён только для уже разблокированного элемента.
+      const audio = voice.getPlaybackAudio() ?? new Audio()
+      assistAudioRef.current = audio
 
       const onDone = () => {
-        assistSourceRef.current = null
-        assistAudioRef.current = null
         if (ttsBlobUrlRef.current) { URL.revokeObjectURL(ttsBlobUrlRef.current); ttsBlobUrlRef.current = null }
+        assistAudioRef.current = null
         voice.setBusy(false)
       }
-
-      if (audioCtx) {
-        // Web Audio path: AudioContext is already unlocked from the mic tap gesture.
-        // AudioBufferSourceNode.start() doesn't require a new user gesture.
-        const arrayBuffer = await res.arrayBuffer()
-        if (!voice.isActive) { voice.setBusy(false); return }
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
-        if (!voice.isActive) { voice.setBusy(false); return }
-        const source = audioCtx.createBufferSource()
-        source.buffer = audioBuffer
-        source.playbackRate.value = getSavedSpeed()
-        source.connect(audioCtx.destination)
-        source.onended = onDone
-        assistSourceRef.current = source
-        if (audioCtx.state !== 'running') await audioCtx.resume()
-        source.start(0)
-      } else {
-        // Desktop fallback (no AudioContext) — new Audio() works without gesture there
-        const blob = await res.blob()
-        if (!voice.isActive) { voice.setBusy(false); return }
-        const url = URL.createObjectURL(blob)
-        ttsBlobUrlRef.current = url
-        const audio = new Audio(url)
-        audio.playbackRate = getSavedSpeed()
-        assistAudioRef.current = audio
-        audio.onended = onDone
-        audio.onerror = onDone
-        audio.play().catch(onDone)
+      audio.onended = onDone
+      audio.onerror = () => {
+        verr('tts: ошибка элемента', audio.error ? `code=${audio.error.code} ${audio.error.message}` : 'unknown')
+        onDone()
       }
-    } catch { voice.setBusy(false) }
+
+      // src меняем без load() — load() сбрасывает разблокировку на iOS
+      audio.src = url
+      audio.playbackRate = getSavedSpeed()
+
+      try {
+        await audio.play()
+        audio.playbackRate = getSavedSpeed()  // некоторые браузеры сбрасывают при смене src
+        vlog('tts: воспроизводится')
+      } catch (e) {
+        const err = e as Error
+        verr(`tts: play() отклонён (${err.name})`, err.message)
+        onDone()
+      }
+    } catch (e) {
+      verr('tts: исключение', e)
+      voice.setBusy(false)
+    }
   }
 
   useEffect(() => {
@@ -292,7 +299,6 @@ export default function AssistantPanel() {
       const next = SPEEDS[newIdx]
       if (next === cur) return
       localStorage.setItem(SPEED_KEY, String(next))
-      if (assistSourceRef.current) assistSourceRef.current.playbackRate.value = next
       if (assistAudioRef.current) assistAudioRef.current.playbackRate = next
     }
     window.addEventListener('voice:change-speed', handle)

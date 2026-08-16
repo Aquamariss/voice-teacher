@@ -4,6 +4,7 @@ import {
   createContext, useContext, useRef, useState,
   useEffect, useCallback, type ReactNode,
 } from 'react'
+import { vlog, vwarn, verr, logEnvironment } from './debugLog'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -20,7 +21,9 @@ interface VoiceContextValue {
   toggleVoice:    () => void
   setAutoEnable:  (val: boolean) => void
   setBusy:        (busy: boolean) => void
-  getAudioCtx:    () => AudioContext | null
+  /** Аудио-элемент, разблокированный жестом пользователя при включении микрофона.
+   *  Его можно проигрывать из async-кода без нового жеста (важно для iOS). */
+  getPlaybackAudio: () => HTMLAudioElement | null
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -29,6 +32,11 @@ const VOICE_THRESHOLD  = 42   // энергия 0-255; поднято с 35 дл
 const SILENCE_MS       = 1400 // мс тишины перед отправкой
 const MIN_RECORD_MS    = 500  // мин. длина записи
 const MIN_VOICE_FRAMES = 8    // кадров подряд выше порога для старта записи (~130 мс)
+
+// Односэмпловый беззвучный WAV. Проигрывается по клику, чтобы «разблокировать»
+// аудио-элемент — после этого iOS разрешает play() из асинхронного кода.
+const SILENT_WAV =
+  'data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA=='
 
 // Слова-команды для управления лекцией.
 // Используем tokenMatchesAny() — точное совпадение токена, не includes()
@@ -47,6 +55,29 @@ function tokenMatchesAny(text: string, words: string[]): boolean {
     .map(t => t.toLowerCase().replace(/[^а-яёa-z0-9]/g, ''))
     .filter(Boolean)
   return words.some(w => tokens.includes(w))
+}
+
+// Расширение файла по MIME — Whisper определяет формат именно по имени файла
+function extFromMime(mime: string): string {
+  if (mime.includes('mp4') || mime.includes('m4a')) return 'mp4'
+  if (mime.includes('ogg'))  return 'ogg'
+  if (mime.includes('wav'))  return 'wav'
+  if (mime.includes('mpeg')) return 'mp3'
+  return 'webm'
+}
+
+// Выбираем первый поддерживаемый контейнер.
+// iOS умеет только audio/mp4, Android/десктоп — webm/opus.
+function pickRecorderMime(): string {
+  if (typeof MediaRecorder === 'undefined') return ''
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/aac',
+    'audio/ogg;codecs=opus',
+  ]
+  return candidates.find(t => MediaRecorder.isTypeSupported(t)) ?? ''
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────
@@ -69,9 +100,9 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
   const streamRef          = useRef<MediaStream | null>(null)
   const audioCtxRef        = useRef<AudioContext | null>(null)
-  const keepaliveRef       = useRef<AudioBufferSourceNode | null>(null)
   const analyserRef        = useRef<AnalyserNode | null>(null)
   const recorderRef        = useRef<MediaRecorder | null>(null)
+  const recorderMimeRef    = useRef('')
   const chunksRef          = useRef<Blob[]>([])
   const isRecordingRef     = useRef(false)
   const silenceTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -81,8 +112,11 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   const busyRef            = useRef(false)
   const isActiveRef        = useRef(false)
   const isLecturePlayingRef = useRef(false)  // true пока лекция воспроизводится
+  const playbackAudioRef   = useRef<HTMLAudioElement | null>(null)
 
   useEffect(() => { isActiveRef.current = isActive }, [isActive])
+
+  useEffect(() => { logEnvironment() }, [])
 
   // ── Слушаем состояние AudioPlayer ─────────────────────────────────────────
 
@@ -110,18 +144,52 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     const stored = localStorage.getItem(AUTO_ENABLE_KEY)
     if (stored === 'true') {
       setAutoEnableState(true)
-      activateVoice().catch(() => {})
+      vlog('autoEnable: активируем без жеста')
+      activateVoice().catch(e => verr('autoEnable failed', e))
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Разблокировка воспроизведения ─────────────────────────────────────────
+  // ВАЖНО: вызывать строго синхронно из обработчика клика, до любого await.
+  // iOS/Android разрешают play() без жеста только для элемента, который уже
+  // хоть раз проигрался в контексте жеста.
+
+  function unlockPlaybackAudio() {
+    let audio = playbackAudioRef.current
+    if (!audio) {
+      audio = new Audio()
+      audio.preload = 'auto'
+      playbackAudioRef.current = audio
+    }
+    try {
+      audio.src = SILENT_WAV
+      const p = audio.play()
+      if (p && typeof p.then === 'function') {
+        p.then(() => vlog('unlock: аудио разблокировано'))
+         .catch(e => vwarn('unlock: play() отклонён', (e as Error)?.name ?? e))
+      } else {
+        vlog('unlock: play() без промиса (старый браузер)')
+      }
+    } catch (e) {
+      vwarn('unlock: исключение', e)
+    }
+  }
 
   // ── VAD ───────────────────────────────────────────────────────────────────
 
   function startVAD() {
     const analyser = analyserRef.current
-    if (!analyser || vadActiveRef.current) return
+    if (!analyser) { vwarn('VAD: нет analyser'); return }
+    if (vadActiveRef.current) { vlog('VAD: уже запущен'); return }
     vadActiveRef.current = true
+    vlog('VAD: запущен')
 
     const buf = new Uint8Array(analyser.frequencyBinCount)
+
+    // Периодически логируем уровень сигнала — так видно, доходит ли звук с
+    // микрофона вообще (главный симптом «кнопка мигает, но записи нет»).
+    let peak = 0
+    let lastReport = Date.now()
 
     const tick = () => {
       if (!vadActiveRef.current) return
@@ -129,6 +197,14 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       analyser.getByteFrequencyData(buf)
       const energy  = buf.reduce((s, v) => s + v, 0) / buf.length
       const isVoice = energy > VOICE_THRESHOLD
+
+      if (energy > peak) peak = energy
+      if (Date.now() - lastReport > 3000) {
+        vlog(`VAD: пик ${peak.toFixed(1)} / порог ${VOICE_THRESHOLD}` +
+             `${peak < 1 ? ' — СИГНАЛА НЕТ' : peak < VOICE_THRESHOLD ? ' — слишком тихо' : ''}`)
+        peak = 0
+        lastReport = Date.now()
+      }
 
       if (isVoice) {
         voiceFramesRef.current++
@@ -182,29 +258,38 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     recordStartRef.current = Date.now()
     setVoiceStatus('recording')
 
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : MediaRecorder.isTypeSupported('audio/mp4')
-          ? 'audio/mp4'
-          : ''
+    const mimeType = recorderMimeRef.current
 
-    const mr = mimeType
-      ? new MediaRecorder(stream, { mimeType })
-      : new MediaRecorder(stream)
+    let mr: MediaRecorder
+    try {
+      mr = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream)
+    } catch (e) {
+      verr('MediaRecorder не создан', e)
+      isRecordingRef.current = false
+      setVoiceError('Запись не поддерживается этим браузером')
+      return
+    }
     recorderRef.current = mr
 
+    const actualMime = mr.mimeType || mimeType || 'audio/webm'
+    vlog(`rec: старт, mime=${actualMime}`)
+
+    mr.onerror = e => verr('MediaRecorder error', (e as unknown as { error?: Error }).error)
     mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
     mr.onstop = () => {
       isRecordingRef.current = false
       const duration = Date.now() - recordStartRef.current
+      const blob = new Blob(chunksRef.current, { type: actualMime })
+      vlog(`rec: стоп, ${duration}мс, ${blob.size} байт, чанков ${chunksRef.current.length}`)
+
       if (duration < MIN_RECORD_MS || chunksRef.current.length === 0) {
+        vlog('rec: слишком коротко — пропускаем')
         if (isActiveRef.current) setVoiceStatus('listening')
         return
       }
-      const ext = mimeType.includes('mp4') ? 'mp4' : 'webm'
-      sendToWhisper(new Blob(chunksRef.current, { type: mimeType || 'audio/webm' }), ext)
+      sendToWhisper(blob, extFromMime(actualMime))
     }
 
     mr.start(100)
@@ -227,14 +312,22 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       const form = new FormData()
       form.append('audio', blob, `recording.${ext}`)
 
+      vlog(`stt: отправка recording.${ext}, ${blob.size} байт`)
       const res = await fetch('/api/stt', { method: 'POST', body: form })
-      if (!res.ok) throw new Error('STT failed')
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        verr(`stt: HTTP ${res.status}`, body.slice(0, 200))
+        setVoiceError(`Ошибка распознавания (${res.status})`)
+        throw new Error('STT failed')
+      }
 
       const { text } = await res.json() as { text: string }
+      vlog('stt: результат', text || '(пусто)')
       const normalized = text.trim().toLowerCase()
 
       // ── КОМАНДЫ СКОРОСТИ — работают в любом режиме ──────────────────────
       if (tokenMatchesAny(normalized, SLOWER_WORDS)) {
+        vlog('cmd: медленнее')
         window.dispatchEvent(new CustomEvent('voice:change-speed', { detail: { direction: 'slower' } }))
         busyRef.current = false
         if (isActiveRef.current) setVoiceStatus('listening')
@@ -242,6 +335,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         return
       }
       if (tokenMatchesAny(normalized, FASTER_WORDS)) {
+        vlog('cmd: быстрее')
         window.dispatchEvent(new CustomEvent('voice:change-speed', { detail: { direction: 'faster' } }))
         busyRef.current = false
         if (isActiveRef.current) setVoiceStatus('listening')
@@ -254,13 +348,14 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       // Это защищает от фантомных сообщений из-за фонового шума и звука лекции.
       if (isLecturePlayingRef.current) {
         if (tokenMatchesAny(normalized, STOP_WORDS)) {
+          vlog('cmd: стоп-лекция')
           window.dispatchEvent(new CustomEvent('voice:stop-lecture'))
           // AudioPlayer выдаст voice:lecture-paused → isLecturePlayingRef = false
           busyRef.current = false
           if (isActiveRef.current) setVoiceStatus('listening')
           restartVADAfter(800)
         } else {
-          // Игнорируем: не отправляем ассистенту
+          vlog('lecture-mode: не команда — игнорируем')
           busyRef.current = false
           if (isActiveRef.current) setVoiceStatus('listening')
         }
@@ -271,6 +366,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
       // Команда «продолжи» — возобновляем лекцию, ассистента не трогаем
       if (tokenMatchesAny(normalized, RESUME_WORDS)) {
+        vlog('cmd: продолжить лекцию')
         window.dispatchEvent(new CustomEvent('voice:resume-lecture'))
         busyRef.current = false
         if (isActiveRef.current) setVoiceStatus('listening')
@@ -282,13 +378,16 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       // Обычное сообщение → ассистент
       if (text.trim() && isActiveRef.current) {
         // busyRef остаётся true до завершения TTS ассистента
+        vlog('→ ассистенту')
         setVoiceStatus('processing')
         window.dispatchEvent(new CustomEvent('voice:user-message', { detail: { text: text.trim() } }))
       } else {
+        vlog('stt: пустой текст — ничего не отправляем')
         busyRef.current = false
         if (isActiveRef.current) setVoiceStatus('listening')
       }
-    } catch {
+    } catch (e) {
+      verr('stt: исключение', e)
       busyRef.current = false
       if (isActiveRef.current) setVoiceStatus('listening')
     }
@@ -298,31 +397,35 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
   async function activateVoice() {
     setVoiceError('')
+    vlog('activate: запрашиваем микрофон')
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true },
-    })
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      })
+    } catch (e) {
+      const err = e as Error
+      verr(`getUserMedia: ${err.name}`, err.message)
+      throw e
+    }
     streamRef.current = stream
 
-    const ctx     = new AudioContext()
+    const track = stream.getAudioTracks()[0]
+    vlog(`activate: трек «${track?.label || 'без имени'}», enabled=${track?.enabled}, state=${track?.readyState}`)
+
+    recorderMimeRef.current = pickRecorderMime()
+    vlog('activate: контейнер записи', recorderMimeRef.current || 'по умолчанию')
+
+    const ctx = new AudioContext()
     audioCtxRef.current = ctx
-    if (ctx.state === 'suspended') await ctx.resume()
+    vlog(`activate: AudioContext state=${ctx.state}, sampleRate=${ctx.sampleRate}`)
+    if (ctx.state === 'suspended') {
+      await ctx.resume()
+      vlog(`activate: после resume() state=${ctx.state}`)
+    }
 
-    // iOS auto-suspends AudioContext when there is no audio output.
-    // A silent looping buffer keeps the context in "running" state so that
-    // AudioBufferSourceNode.start() works later without a new user gesture.
-    const keepaliveBuf = ctx.createBuffer(1, 1024, ctx.sampleRate)
-    const keepaliveSrc = ctx.createBufferSource()
-    keepaliveSrc.buffer = keepaliveBuf
-    keepaliveSrc.loop = true
-    const silentGain = ctx.createGain()
-    silentGain.gain.value = 0
-    keepaliveSrc.connect(silentGain)
-    silentGain.connect(ctx.destination)
-    keepaliveSrc.start(0)
-    keepaliveRef.current = keepaliveSrc
-
-    const src     = ctx.createMediaStreamSource(stream)
+    const src      = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 512
     analyser.smoothingTimeConstant = 0.3
@@ -335,9 +438,11 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     setIsActive(true)
     setVoiceStatus('listening')
     startVAD()
+    vlog('activate: готово')
   }
 
   function deactivateVoice() {
+    vlog('deactivate')
     vadActiveRef.current = false
 
     if (silenceTimerRef.current) {
@@ -346,9 +451,8 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     }
     finishRecording()
 
-    if (keepaliveRef.current) { try { keepaliveRef.current.stop() } catch { /* ignore */ }; keepaliveRef.current = null }
     if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
-    if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null }
     analyserRef.current   = null
     busyRef.current        = false
     isRecordingRef.current = false
@@ -357,13 +461,17 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     setVoiceStatus('idle')
   }
 
-  async function toggleVoice() {
+  // НЕ async: разблокировка звука должна произойти синхронно внутри жеста,
+  // иначе iOS не считает play() пользовательским действием.
+  function toggleVoice() {
     if (isActive) {
       deactivateVoice()
-    } else {
-      try { await activateVoice() }
-      catch { setVoiceError('Нет доступа к микрофону. На iPhone: Настройки → Chrome → Микрофон → включить') }
+      return
     }
+    unlockPlaybackAudio()
+    activateVoice().catch(() => {
+      setVoiceError('Нет доступа к микрофону. На iPhone: Настройки → Chrome → Микрофон → включить')
+    })
   }
 
   function setAutoEnable(val: boolean) {
@@ -376,9 +484,8 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     return () => {
       vadActiveRef.current = false
-      if (keepaliveRef.current) { try { keepaliveRef.current.stop() } catch { /* ignore */ } }
       if (streamRef.current)   streamRef.current.getTracks().forEach(t => t.stop())
-      if (audioCtxRef.current) audioCtxRef.current.close()
+      if (audioCtxRef.current) audioCtxRef.current.close().catch(() => {})
     }
   }, [])
 
@@ -389,7 +496,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       voiceStatus, setVoiceStatus,
       isActive, autoEnable, voiceError,
       toggleVoice, setAutoEnable, setBusy,
-      getAudioCtx: () => audioCtxRef.current,
+      getPlaybackAudio: () => playbackAudioRef.current,
     }}>
       {children}
     </VoiceContext.Provider>

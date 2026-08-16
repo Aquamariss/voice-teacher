@@ -57,6 +57,7 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
   const pendingBuffers  = useRef<ArrayBuffer[]>([])
   const cancelledRef    = useRef(false)
   const userPausedRef   = useRef(false)
+  const isFallbackRef   = useRef(false)
 
   function fmt(sec: number) {
     const m = Math.floor(sec / 60)
@@ -148,10 +149,11 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     }
   }
 
-  // Запасной вариант: blob по чанкам (без MSE)
+  // Запасной вариант: blob по чанкам (без MSE) — используется на iOS
   async function fallbackBlobChunks(chunks: string[]) {
     const audio = audioRef.current!
     let currentUrl: string | null = null
+    isFallbackRef.current = true
 
     const waitEnded = () => new Promise<void>(resolve => {
       audio.addEventListener('ended', () => resolve(), { once: true })
@@ -170,7 +172,8 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
         if (currentUrl) URL.revokeObjectURL(currentUrl)
         currentUrl = URL.createObjectURL(blob)
         audio.src = currentUrl
-        audio.load()
+        // Не вызываем audio.load() — это сбрасывает iOS-разрешение на autoplay.
+        // play() сам загружает src если нужно.
         setChunksReady(i + 1)
         if (!userPausedRef.current) audio.play().catch(() => {})
         await waitEnded()
@@ -179,6 +182,7 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     } catch {
       if (!cancelledRef.current) { setState('error'); setError('Ошибка воспроизведения') }
     } finally {
+      isFallbackRef.current = false
       if (currentUrl) URL.revokeObjectURL(currentUrl)
     }
   }
@@ -213,6 +217,7 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     audio.addEventListener('ended', () => {
       window.dispatchEvent(new CustomEvent('voice:lecture-paused'))
       if (cancelledRef.current) return
+      if (isFallbackRef.current) return  // fallbackBlobChunks manages onEnded itself
       setState('done'); onEnded?.()
     })
     audio.addEventListener('error', () => {
@@ -221,6 +226,16 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     audio.addEventListener('canplay', () => {
       if (!cancelledRef.current) tryPlay(audio)
     }, { once: true })
+
+    const mseOk =
+      typeof MediaSource !== 'undefined' &&
+      typeof MediaSource.isTypeSupported === 'function' &&
+      MediaSource.isTypeSupported('audio/mpeg')
+
+    if (!mseOk) {
+      fallbackBlobChunks(chunks)
+      return
+    }
 
     const ms = new MediaSource()
     mediaSourceRef.current = ms
@@ -283,6 +298,11 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     localStorage.setItem(SPEED_KEY, String(s))
     if (audioRef.current) audioRef.current.playbackRate = s
   }
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('audio-player:open'))
+    return () => { window.dispatchEvent(new CustomEvent('audio-player:close')) }
+  }, [])
 
   useEffect(() => {
     startStream()
