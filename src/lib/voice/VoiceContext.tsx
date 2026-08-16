@@ -5,6 +5,7 @@ import {
   useEffect, useCallback, type ReactNode,
 } from 'react'
 import { vlog, vwarn, verr, logEnvironment } from './debugLog'
+import { unlockEarcons, earconStart, earconEnd } from './earcons'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -28,10 +29,25 @@ interface VoiceContextValue {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VOICE_THRESHOLD  = 42   // энергия 0-255; поднято с 35 для снижения фантомных срабатываний
-const SILENCE_MS       = 1400 // мс тишины перед отправкой
+// Гистерезис: начинать запись строго, прекращать мягко.
+// Один общий порог обрывал фразу на спаде громкости — речь на 30 единицах
+// считалась тишиной, и вопрос уезжал в Whisper недоговорённым.
+const VOICE_START_THRESHOLD = 42  // энергия 0-255, порог начала записи
+const VOICE_STOP_THRESHOLD  = 25  // ниже этого считаем, что человек замолчал
+
+const SILENCE_MS       = 2200 // мс тишины перед отправкой (было 1400 — резало паузы в речи)
 const MIN_RECORD_MS    = 500  // мин. длина записи
 const MIN_VOICE_FRAMES = 8    // кадров подряд выше порога для старта записи (~130 мс)
+// Перебивание ассистента: планка выше, чтобы его собственный голос из динамика
+// не запускал запись. Эхоподавление даёт 3-8 единиц, редкие всплески до 31.
+const BARGE_IN_FRAMES  = 18   // ~300 мс уверенной речи поверх ответа
+
+const RECORDER_BITRATE = 32000 // бит/с; речи хватает, а заливка с мобильной сети быстрее
+
+// Признак пропавшего входного потока: Bluetooth-гарнитура при смене профиля
+// оставляет MediaStream живым, но выдаёт нули.
+const DEAD_SIGNAL_LEVEL = 0.3
+const DEAD_SIGNAL_MS    = 5000
 
 // Односэмпловый беззвучный WAV. Проигрывается по клику, чтобы «разблокировать»
 // аудио-элемент — после этого iOS разрешает play() из асинхронного кода.
@@ -93,14 +109,18 @@ export function useVoice() {
 // ── Provider ──────────────────────────────────────────────────────────────────
 
 export function VoiceProvider({ children }: { children: ReactNode }) {
-  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('idle')
+  const [voiceStatus, setVoiceStatusState] = useState<VoiceStatus>('idle')
   const [isActive,    setIsActive]    = useState(false)
   const [autoEnable,  setAutoEnableState] = useState(false)
   const [voiceError,  setVoiceError]  = useState('')
 
   const streamRef          = useRef<MediaStream | null>(null)
   const audioCtxRef        = useRef<AudioContext | null>(null)
+  const micSourceRef       = useRef<MediaStreamAudioSourceNode | null>(null)
   const analyserRef        = useRef<AnalyserNode | null>(null)
+  const recoveringRef      = useRef(false)
+  const deadSinceRef       = useRef(0)
+  const voiceStatusRef     = useRef<VoiceStatus>('idle')
   const recorderRef        = useRef<MediaRecorder | null>(null)
   const recorderMimeRef    = useRef('')
   const chunksRef          = useRef<Blob[]>([])
@@ -117,6 +137,12 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   useEffect(() => { isActiveRef.current = isActive }, [isActive])
 
   useEffect(() => { logEnvironment() }, [])
+
+  // Статус нужен и синхронно (в цикле VAD), поэтому дублируем его в ref
+  const setVoiceStatus = useCallback((s: VoiceStatus) => {
+    voiceStatusRef.current = s
+    setVoiceStatusState(s)
+  }, [])
 
   // ── Слушаем состояние AudioPlayer ─────────────────────────────────────────
 
@@ -195,34 +221,57 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       if (!vadActiveRef.current) return
 
       analyser.getByteFrequencyData(buf)
-      const energy  = buf.reduce((s, v) => s + v, 0) / buf.length
-      const isVoice = energy > VOICE_THRESHOLD
+      const energy = buf.reduce((s, v) => s + v, 0) / buf.length
+
+      const aboveStart = energy > VOICE_START_THRESHOLD
+      const aboveStop  = energy > VOICE_STOP_THRESHOLD
 
       if (energy > peak) peak = energy
       if (Date.now() - lastReport > 3000) {
-        vlog(`VAD: пик ${peak.toFixed(1)} / порог ${VOICE_THRESHOLD}` +
-             `${peak < 1 ? ' — СИГНАЛА НЕТ' : peak < VOICE_THRESHOLD ? ' — слишком тихо' : ''}`)
+        vlog(`VAD: пик ${peak.toFixed(1)} / порог ${VOICE_START_THRESHOLD}` +
+             `${peak < 1 ? ' — СИГНАЛА НЕТ' : peak < VOICE_START_THRESHOLD ? ' — слишком тихо' : ''}`)
         peak = 0
         lastReport = Date.now()
       }
 
-      if (isVoice) {
-        voiceFramesRef.current++
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current)
-          silenceTimerRef.current = null
+      // ── Детектор мёртвого потока ──────────────────────────────────────
+      // Смена Bluetooth-профиля оставляет трек «живым», но данные — нули.
+      if (energy < DEAD_SIGNAL_LEVEL) {
+        if (deadSinceRef.current === 0) deadSinceRef.current = Date.now()
+        else if (
+          Date.now() - deadSinceRef.current > DEAD_SIGNAL_MS &&
+          !isRecordingRef.current && !recoveringRef.current
+        ) {
+          deadSinceRef.current = 0
+          recoverMic()
         }
-        if (
-          voiceFramesRef.current >= MIN_VOICE_FRAMES &&
-          !isRecordingRef.current &&
-          !busyRef.current
-        ) beginRecording()
       } else {
-        voiceFramesRef.current = 0  // сбрасываем при тишине
+        deadSinceRef.current = 0
       }
 
-      if (!isVoice && isRecordingRef.current) {
-        if (!silenceTimerRef.current) {
+      // ── Старт записи ──────────────────────────────────────────────────
+      // Во время речи ассистента запись разрешена — это перебивание, но с
+      // повышенной планкой, чтобы его собственный голос её не запускал.
+      const speaking     = voiceStatusRef.current === 'speaking'
+      const framesNeeded = speaking ? BARGE_IN_FRAMES : MIN_VOICE_FRAMES
+      const mayRecord    = !isRecordingRef.current && (!busyRef.current || speaking)
+
+      if (aboveStart) {
+        voiceFramesRef.current++
+        if (voiceFramesRef.current >= framesNeeded && mayRecord) beginRecording()
+      } else {
+        voiceFramesRef.current = 0
+      }
+
+      // ── Остановка записи ──────────────────────────────────────────────
+      // Порог ниже, чем для старта: тихий хвост фразы не считается тишиной.
+      if (isRecordingRef.current) {
+        if (aboveStop) {
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current)
+            silenceTimerRef.current = null
+          }
+        } else if (!silenceTimerRef.current) {
           silenceTimerRef.current = setTimeout(() => {
             silenceTimerRef.current = null
             finishRecording()
@@ -234,6 +283,53 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     }
 
     requestAnimationFrame(tick)
+  }
+
+  // ── Восстановление микрофона ──────────────────────────────────────────────
+  // Bluetooth-гарнитура при переключении профиля (воспроизведение ↔ запись)
+  // оставляет трек в состоянии live, но поток отдаёт нули. Единственное
+  // лекарство — перезахватить getUserMedia. AudioContext при этом сохраняем:
+  // повторный resume() на iOS ненадёжен.
+
+  function attachTrackWatchers(stream: MediaStream) {
+    const track = stream.getAudioTracks()[0]
+    if (!track) return
+    track.onmute   = () => { vwarn('mic: трек заглушён системой'); recoverMic() }
+    track.onended  = () => { vwarn('mic: трек завершён');          recoverMic() }
+    track.onunmute = () => vlog('mic: трек снова активен')
+  }
+
+  async function recoverMic() {
+    if (recoveringRef.current || !isActiveRef.current) return
+    recoveringRef.current = true
+    vwarn('mic: сигнал пропал — перезахватываем поток')
+
+    try {
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      })
+      streamRef.current = stream
+
+      const ctx = audioCtxRef.current
+      if (ctx) {
+        if (ctx.state === 'suspended') await ctx.resume()
+        if (micSourceRef.current) { try { micSourceRef.current.disconnect() } catch { /* уже отключён */ } }
+        const src = ctx.createMediaStreamSource(stream)
+        if (analyserRef.current) src.connect(analyserRef.current)
+        micSourceRef.current = src
+      }
+
+      attachTrackWatchers(stream)
+      deadSinceRef.current = 0
+      vlog(`mic: поток восстановлен, трек «${stream.getAudioTracks()[0]?.label || 'без имени'}»`)
+    } catch (e) {
+      verr('mic: восстановить не удалось', e)
+      setVoiceError('Микрофон отключился. Выключи и включи голосовой режим.')
+    } finally {
+      recoveringRef.current = false
+    }
   }
 
   // Остановить VAD, подождать delay мс, запустить снова.
@@ -251,20 +347,29 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     const stream = streamRef.current
     if (!stream || isRecordingRef.current) return
 
+    // Перебивание: ассистент говорил, но человек начал спрашивать.
+    // Снимаем блокировку, иначе запись останется заперта до конца ответа.
+    const bargingIn = voiceStatusRef.current === 'speaking'
+    if (bargingIn) {
+      vlog('перебивание: останавливаем ответ ассистента')
+      busyRef.current = false
+    }
+
     window.dispatchEvent(new CustomEvent('voice:interrupt-audio'))
 
     isRecordingRef.current = true
     chunksRef.current      = []
     recordStartRef.current = Date.now()
     setVoiceStatus('recording')
+    earconStart()
 
     const mimeType = recorderMimeRef.current
 
     let mr: MediaRecorder
     try {
       mr = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream)
+        ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: RECORDER_BITRATE })
+        : new MediaRecorder(stream, { audioBitsPerSecond: RECORDER_BITRATE })
     } catch (e) {
       verr('MediaRecorder не создан', e)
       isRecordingRef.current = false
@@ -289,6 +394,9 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         if (isActiveRef.current) setVoiceStatus('listening')
         return
       }
+      // «Понял, помолчи» — единственный сигнал, который слышен, когда
+      // телефон в кармане и экран не виден
+      earconEnd()
       sendToWhisper(blob, extFromMime(actualMime))
     }
 
@@ -430,10 +538,14 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     analyser.fftSize = 512
     analyser.smoothingTimeConstant = 0.3
     src.connect(analyser)
-    analyserRef.current = analyser
+    micSourceRef.current = src
+    analyserRef.current  = analyser
+
+    attachTrackWatchers(stream)
 
     busyRef.current      = false
     vadActiveRef.current = false
+    deadSinceRef.current = 0
 
     setIsActive(true)
     setVoiceStatus('listening')
@@ -453,9 +565,11 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
     if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
     if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null }
+    micSourceRef.current  = null
     analyserRef.current   = null
     busyRef.current        = false
     isRecordingRef.current = false
+    deadSinceRef.current   = 0
 
     setIsActive(false)
     setVoiceStatus('idle')
@@ -469,6 +583,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       return
     }
     unlockPlaybackAudio()
+    unlockEarcons()
     activateVoice().catch(() => {
       setVoiceError('Нет доступа к микрофону. На iPhone: Настройки → Chrome → Микрофон → включить')
     })

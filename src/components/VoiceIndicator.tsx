@@ -34,12 +34,18 @@ export default function VoiceIndicator() {
   if (panelOpen) return null
 
   const isPulsing = voiceStatus === 'listening' || voiceStatus === 'recording'
-  const isSpinning = voiceStatus === 'transcribing'
+  // Распознавание и обдумывание — самая долгая часть ожидания. Обе фазы
+  // должны читаться как «занят», иначе пользователь переспрашивает.
+  const isSpinning = voiceStatus === 'transcribing' || voiceStatus === 'processing'
 
   const icon = voiceStatus === 'recording'    ? '🔴'
     : voiceStatus === 'speaking'              ? '🔊'
-    : voiceStatus === 'transcribing'          ? '⟳'
+    : isSpinning                              ? '⟳'
     : '🎙️'
+
+  // На мобильном подпись обычно скрыта ради места, но когда система занята,
+  // она важнее компактности
+  const busy = isSpinning || voiceStatus === 'speaking'
 
   const colorClass = isActive
     ? activeClass[voiceStatus]
@@ -58,7 +64,7 @@ export default function VoiceIndicator() {
         `}
       >
         <span className={isSpinning ? 'inline-block animate-spin' : ''}>{icon}</span>
-        <span className="text-xs font-medium hidden sm:inline">
+        <span className={`text-xs font-medium ${busy ? 'inline' : 'hidden sm:inline'}`}>
           {statusLabel[voiceStatus]}
         </span>
       </button>

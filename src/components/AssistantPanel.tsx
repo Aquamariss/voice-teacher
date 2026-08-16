@@ -914,9 +914,14 @@ export default function AssistantPanel() {
     transcribing: 'Распознаю...', processing: 'Думаю...', speaking: 'Говорю...',
   }
 
+  // Пока идёт распознавание и обдумывание, ждать приходится дольше всего —
+  // раньше кнопка в этот момент выглядела как обычное ожидание, и пользователь
+  // переспрашивал. Обе фазы теперь крутят спиннер.
+  const micBusy = voice.voiceStatus === 'transcribing' || voice.voiceStatus === 'processing'
+
   const micIcon  = voice.voiceStatus === 'speaking' ? '🔊'
     : voice.voiceStatus === 'recording'             ? '🔴'
-    : voice.voiceStatus === 'transcribing'          ? '⟳'
+    : micBusy                                       ? '⟳'
     : '🎙️'
   const micPulse = voice.voiceStatus === 'listening' || voice.voiceStatus === 'recording'
 
@@ -966,6 +971,14 @@ export default function AssistantPanel() {
             {voice.voiceError}
           </div>
         )}
+        {/* Панель свёрнута — без этой подписи на телефоне не видно,
+            что система занята, и вопрос хочется повторить */}
+        {voice.isActive && voice.voiceStatus !== 'listening' && voice.voiceStatus !== 'idle' && (
+          <div className="flex items-center gap-1.5 bg-white/95 border border-gray-200 text-gray-700 text-xs font-medium rounded-full px-3 py-1.5 shadow-sm">
+            {micBusy && <span className="inline-block animate-spin text-gray-400">⟳</span>}
+            {statusLabel[voice.voiceStatus]}
+          </div>
+        )}
         <div className="flex items-center gap-2">
         <button
           onClick={handleMicClick}
@@ -978,7 +991,7 @@ export default function AssistantPanel() {
             ${micPulse ? 'animate-pulse' : ''}
           `}
         >
-          <span className={voice.voiceStatus === 'transcribing' ? 'animate-spin' : ''}>{micIcon}</span>
+          <span className={micBusy ? 'inline-block animate-spin' : ''}>{micIcon}</span>
         </button>
         <button
           onClick={toggle}
