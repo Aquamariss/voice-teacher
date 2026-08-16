@@ -92,6 +92,7 @@ export default function AssistantPanel() {
   const voice    = useVoice()
 
   const [panelState,          setPanelState]          = useState<PanelState>('collapsed')
+  const [audioPlayerOpen,     setAudioPlayerOpen]     = useState(false)
   const [mode,                setMode]                = useState<PanelMode>('assistant')
   const [messages,            setMessages]            = useState<Message[]>([])
   const [input,               setInput]               = useState('')
@@ -105,6 +106,7 @@ export default function AssistantPanel() {
   const [topicStructure,      setTopicStructure]      = useState<AgentTopicStructure | null>(null)
   const [savingTopic,         setSavingTopic]         = useState(false)
   const [showScrollButton,    setShowScrollButton]    = useState(false)
+  const [showMicGuide,        setShowMicGuide]        = useState(false)
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const inputRef           = useRef<HTMLTextAreaElement>(null)
@@ -116,8 +118,9 @@ export default function AssistantPanel() {
   const editContextRef     = useRef<{ discipline: Discipline; topics: Topic[] } | null>(null)
   const topicCtxRef        = useRef<TopicStructureCtx | null>(null)
   const modeRef        = useRef<PanelMode>('assistant')
-  const assistAudioRef = useRef<HTMLAudioElement | null>(null)
-  const ttsBlobUrlRef  = useRef<string | null>(null)
+  const assistAudioRef  = useRef<HTMLAudioElement | null>(null)
+  const assistSourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const ttsBlobUrlRef   = useRef<string | null>(null)
   // Tracks the currently viewed lesson (for quiz context)
   const activeLessonIdRef = useRef<string | null>(null)
 
@@ -147,6 +150,18 @@ export default function AssistantPanel() {
       setShowScrollButton(true)
     }
   }
+
+  // Track AudioPlayer visibility to avoid button overlap on mobile
+  useEffect(() => {
+    const onOpen  = () => setAudioPlayerOpen(true)
+    const onClose = () => setAudioPlayerOpen(false)
+    window.addEventListener('audio-player:open',  onOpen)
+    window.addEventListener('audio-player:close', onClose)
+    return () => {
+      window.removeEventListener('audio-player:open',  onOpen)
+      window.removeEventListener('audio-player:close', onClose)
+    }
+  }, [])
 
   // Panel opens → reset to bottom
   useEffect(() => {
@@ -189,6 +204,11 @@ export default function AssistantPanel() {
   // ── TTS ───────────────────────────────────────────────────────────────────────
 
   function stopAssistantAudio() {
+    if (assistSourceRef.current) {
+      try { assistSourceRef.current.stop() } catch { /* already stopped */ }
+      assistSourceRef.current.onended = null
+      assistSourceRef.current = null
+    }
     if (assistAudioRef.current) {
       assistAudioRef.current.onended = null
       assistAudioRef.current.onerror = null
@@ -206,27 +226,50 @@ export default function AssistantPanel() {
     stopAssistantAudio()
     voice.setBusy(true)
     voice.setVoiceStatus('speaking')
+
+    const audioCtx = voice.getAudioCtx()
+
     try {
       const res = await fetch('/api/tts', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, voiceId: getVoiceId() }),
       })
       if (!res.ok || !voice.isActive) { voice.setBusy(false); return }
-      const blob = await res.blob()
-      if (!voice.isActive) { voice.setBusy(false); return }
-      const url = URL.createObjectURL(blob)
-      ttsBlobUrlRef.current = url
-      const audio = new Audio(url)
-      audio.playbackRate = getSavedSpeed()
-      assistAudioRef.current = audio
+
       const onDone = () => {
-        if (ttsBlobUrlRef.current) { URL.revokeObjectURL(ttsBlobUrlRef.current); ttsBlobUrlRef.current = null }
+        assistSourceRef.current = null
         assistAudioRef.current = null
+        if (ttsBlobUrlRef.current) { URL.revokeObjectURL(ttsBlobUrlRef.current); ttsBlobUrlRef.current = null }
         voice.setBusy(false)
       }
-      audio.onended = onDone
-      audio.onerror = onDone
-      audio.play().catch(onDone)
+
+      if (audioCtx) {
+        // Web Audio path: AudioContext is already unlocked from the mic tap gesture.
+        // AudioBufferSourceNode.start() doesn't require a new user gesture.
+        const arrayBuffer = await res.arrayBuffer()
+        if (!voice.isActive) { voice.setBusy(false); return }
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+        if (!voice.isActive) { voice.setBusy(false); return }
+        const source = audioCtx.createBufferSource()
+        source.buffer = audioBuffer
+        source.playbackRate.value = getSavedSpeed()
+        source.connect(audioCtx.destination)
+        source.onended = onDone
+        assistSourceRef.current = source
+        source.start(0)
+      } else {
+        // Desktop fallback (no AudioContext) — new Audio() works without gesture there
+        const blob = await res.blob()
+        if (!voice.isActive) { voice.setBusy(false); return }
+        const url = URL.createObjectURL(blob)
+        ttsBlobUrlRef.current = url
+        const audio = new Audio(url)
+        audio.playbackRate = getSavedSpeed()
+        assistAudioRef.current = audio
+        audio.onended = onDone
+        audio.onerror = onDone
+        audio.play().catch(onDone)
+      }
     } catch { voice.setBusy(false) }
   }
 
@@ -248,6 +291,7 @@ export default function AssistantPanel() {
       const next = SPEEDS[newIdx]
       if (next === cur) return
       localStorage.setItem(SPEED_KEY, String(next))
+      if (assistSourceRef.current) assistSourceRef.current.playbackRate.value = next
       if (assistAudioRef.current) assistAudioRef.current.playbackRate = next
     }
     window.addEventListener('voice:change-speed', handle)
@@ -837,6 +881,17 @@ export default function AssistantPanel() {
     }
   }
 
+  function handleMicClick() {
+    if (voice.isActive) { voice.toggleVoice(); return }
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    const seen  = localStorage.getItem('mic-guide-seen')
+    if (isIOS && !seen) {
+      setShowMicGuide(true)
+    } else {
+      voice.toggleVoice()
+    }
+  }
+
   function toggle() {
     setPanelState(s => {
       const next = s === 'collapsed' ? 'open' : 'collapsed'
@@ -862,9 +917,51 @@ export default function AssistantPanel() {
 
   if (panelState === 'collapsed') {
     return (
-      <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2">
+      <>
+      {showMicGuide && (
+        <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center p-4 bg-black/40">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6">
+            <div className="text-2xl mb-3">🎙</div>
+            <h2 className="text-base font-semibold text-gray-900 mb-2">Нужен доступ к микрофону</h2>
+            <p className="text-sm text-gray-600 mb-4 leading-relaxed">
+              На iPhone браузер не может запросить доступ к микрофону самостоятельно — его нужно разрешить в системных настройках.
+            </p>
+            <ol className="text-sm text-gray-700 space-y-1.5 mb-5 list-decimal list-inside">
+              <li>Открой <strong>Настройки</strong> iPhone</li>
+              <li>Прокрути вниз и выбери <strong>Chrome</strong></li>
+              <li>Включи переключатель <strong>Микрофон</strong></li>
+              <li>Вернись в браузер и нажми кнопку снова</li>
+            </ol>
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setShowMicGuide(false) }}
+                className="flex-1 text-sm text-gray-500 py-2.5 rounded-xl border border-gray-200 hover:bg-gray-50"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() => {
+                  localStorage.setItem('mic-guide-seen', '1')
+                  setShowMicGuide(false)
+                  voice.toggleVoice()
+                }}
+                className="flex-1 text-sm font-medium bg-blue-600 text-white py-2.5 rounded-xl hover:bg-blue-700"
+              >
+                Включить голос
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div className={`fixed ${audioPlayerOpen ? 'bottom-36' : 'bottom-5'} right-5 z-50 flex flex-col items-end gap-2 transition-[bottom] duration-200`}>
+        {voice.voiceError && (
+          <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg px-3 py-1.5 max-w-[220px] shadow-sm">
+            {voice.voiceError}
+          </div>
+        )}
+        <div className="flex items-center gap-2">
         <button
-          onClick={voice.toggleVoice}
+          onClick={handleMicClick}
           title={voice.isActive ? 'Выключить голос' : 'Включить голос'}
           className={`
             flex items-center justify-center w-10 h-10 rounded-full border shadow-md transition-all
@@ -885,7 +982,9 @@ export default function AssistantPanel() {
           <span className="text-sm font-medium hidden sm:inline">Ассистент</span>
           {messages.length > 0 && <span className="w-2 h-2 rounded-full bg-blue-400 shrink-0" />}
         </button>
+        </div>
       </div>
+      </>
     )
   }
 

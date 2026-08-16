@@ -20,6 +20,7 @@ interface VoiceContextValue {
   toggleVoice:    () => void
   setAutoEnable:  (val: boolean) => void
   setBusy:        (busy: boolean) => void
+  getAudioCtx:    () => AudioContext | null
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -182,9 +183,15 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
-      : 'audio/webm'
+      : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : MediaRecorder.isTypeSupported('audio/mp4')
+          ? 'audio/mp4'
+          : ''
 
-    const mr = new MediaRecorder(stream, { mimeType })
+    const mr = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream)
     recorderRef.current = mr
 
     mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
@@ -195,7 +202,8 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         if (isActiveRef.current) setVoiceStatus('listening')
         return
       }
-      sendToWhisper(new Blob(chunksRef.current, { type: mimeType }))
+      const ext = mimeType.includes('mp4') ? 'mp4' : 'webm'
+      sendToWhisper(new Blob(chunksRef.current, { type: mimeType || 'audio/webm' }), ext)
     }
 
     mr.start(100)
@@ -209,14 +217,14 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
   // ── Whisper + логика команд ───────────────────────────────────────────────
 
-  async function sendToWhisper(blob: Blob) {
+  async function sendToWhisper(blob: Blob, ext = 'webm') {
     // Блокируем VAD на время транскрипции — предотвращаем параллельные записи
     busyRef.current = true
     setVoiceStatus('transcribing')
 
     try {
       const form = new FormData()
-      form.append('audio', blob, 'recording.webm')
+      form.append('audio', blob, `recording.${ext}`)
 
       const res = await fetch('/api/stt', { method: 'POST', body: form })
       if (!res.ok) throw new Error('STT failed')
@@ -297,6 +305,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
     const ctx     = new AudioContext()
     audioCtxRef.current = ctx
+    if (ctx.state === 'suspended') await ctx.resume()
     const src     = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 512
@@ -336,7 +345,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       deactivateVoice()
     } else {
       try { await activateVoice() }
-      catch { setVoiceError('Нет доступа к микрофону') }
+      catch { setVoiceError('Нет доступа к микрофону. На iPhone: Настройки → Chrome → Микрофон → включить') }
     }
   }
 
@@ -362,6 +371,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       voiceStatus, setVoiceStatus,
       isActive, autoEnable, voiceError,
       toggleVoice, setAutoEnable, setBusy,
+      getAudioCtx: () => audioCtxRef.current,
     }}>
       {children}
     </VoiceContext.Provider>
