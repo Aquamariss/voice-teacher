@@ -666,11 +666,33 @@ export default function TopicClient({
       .filter(([k]) => k.startsWith('2_'))
       .reduce((s, [, v]) => s + (v.score ?? 0), 0)
 
+    const quizReadyParts = lesson.parts.filter(p => p.status === 'ready').sort((a, b) => a.part_number - b.part_number)
+    const quizTotalParts = quizReadyParts.length
+    const quizLastPart = quizReadyParts[quizTotalParts - 1]
+    const quizNavRow = quizTotalParts > 0 ? (
+      <div className="grid grid-cols-3 items-center text-sm py-1 mb-3">
+        <div>
+          <button
+            onClick={() => quizLastPart && setViewingPart({ lesson, part: quizLastPart })}
+            className="text-gray-500 hover:text-gray-800 transition-colors"
+          >
+            ← Часть {quizTotalParts}
+          </button>
+        </div>
+        <div className="text-center">
+          <span className="text-xs text-purple-600 font-medium">Тест</span>
+        </div>
+        <div />
+      </div>
+    ) : null
+
     return (
       <div className="max-w-2xl pb-28">
         <button onClick={() => setViewingQuiz(null)} className="text-sm text-gray-500 hover:text-gray-800 mb-4">
           ← Назад к занятию
         </button>
+
+        {quizNavRow}
 
         <p className="text-xs font-medium text-purple-400 uppercase tracking-wide mb-0.5">Проверка знаний</p>
         <h2 className="text-xl font-semibold text-gray-900 mb-6">{lesson.name}</h2>
@@ -854,6 +876,34 @@ export default function TopicClient({
       if (firstPart) setViewingPart({ lesson: l, part: firstPart })
     }
 
+    const partNavRow = totalParts > 1 ? (
+      <div className="grid grid-cols-3 items-center text-sm py-1">
+        <div>
+          {hasPrev && (
+            <button onClick={goPrev} className="text-gray-500 hover:text-gray-800 transition-colors">
+              ← Часть {currentNavIdx}
+            </button>
+          )}
+        </div>
+        <div className="text-center">
+          <span className="text-xs text-blue-600 font-medium">
+            Часть {currentNavIdx + 1} из {totalParts}
+          </span>
+        </div>
+        <div className="text-right">
+          {hasNext ? (
+            <button onClick={goNext} className="text-blue-600 hover:text-blue-800 transition-colors font-medium">
+              Часть {currentNavIdx + 2} →
+            </button>
+          ) : lesson.quiz_data ? (
+            <button onClick={() => enterQuiz(lesson)} className="text-purple-600 hover:text-purple-800 transition-colors font-medium">
+              Тест →
+            </button>
+          ) : null}
+        </div>
+      </div>
+    ) : null
+
     return (
       <div className="max-w-2xl pb-28">
         {/* Навигация */}
@@ -892,35 +942,16 @@ export default function TopicClient({
           </div>
         )}
 
+        {partNavRow && <div className="mb-3">{partNavRow}</div>}
         <p className="text-xs font-medium text-purple-400 uppercase tracking-wide mb-0.5">Занятие</p>
         <h2 className="text-xl font-semibold text-gray-900 mb-0.5">{lesson.name}</h2>
-        {totalParts > 1 && (
-          <p className="text-sm text-blue-600 mb-1">Часть {currentNavIdx + 1} из {totalParts}</p>
-        )}
         <p className="text-xs text-gray-400 mb-6">
           {topic.lesson_duration_minutes} мин · {complexityLabel[topic.complexity]} · {depthLabel[topic.depth]}
         </p>
 
         <PartContent content={part.content ?? ''} images={part.images} />
 
-        {totalParts > 1 && (
-          <div className="flex justify-between mb-6">
-            <button
-              onClick={goPrev}
-              disabled={!hasPrev}
-              className="text-sm text-gray-500 hover:text-gray-800 disabled:opacity-30 transition-colors"
-            >
-              ← Часть {currentNavIdx}
-            </button>
-            <button
-              onClick={goNext}
-              disabled={!hasNext}
-              className="text-sm text-blue-600 hover:text-blue-800 disabled:opacity-30 transition-colors font-medium"
-            >
-              Часть {currentNavIdx + 2} →
-            </button>
-          </div>
-        )}
+        {partNavRow && <div className="mt-6 mb-4 border-t border-gray-100 pt-4">{partNavRow}</div>}
 
         {/* Проверка знаний — только после последней части */}
         {isLastPart && lesson.quiz_data && (
@@ -1145,11 +1176,24 @@ export default function TopicClient({
                             className="w-full text-sm font-medium text-gray-800 border-b border-blue-400 outline-none bg-transparent"
                           />
                         ) : (
-                          <span
-                            className="text-sm font-medium text-gray-800 cursor-pointer hover:text-blue-700 block"
-                            onClick={() => setEditingLesson(lesson.id)}
-                          >
-                            {lesson.name}
+                          <span className="flex items-center gap-1 group/lesson">
+                            {readyParts.length > 0 ? (
+                              <button
+                                onClick={() => setViewingPart({ lesson, part: readyParts[0] })}
+                                className="text-sm font-medium text-gray-800 hover:text-blue-700 transition-colors text-left"
+                              >
+                                {lesson.name}
+                              </button>
+                            ) : (
+                              <span className="text-sm font-medium text-gray-800">{lesson.name}</span>
+                            )}
+                            <button
+                              onClick={() => setEditingLesson(lesson.id)}
+                              className="text-gray-300 hover:text-gray-500 text-xs opacity-0 group-hover/lesson:opacity-100 transition-opacity shrink-0"
+                              title="Переименовать"
+                            >
+                              ✎
+                            </button>
                           </span>
                         )}
                         {lesson.description && (
@@ -1231,7 +1275,7 @@ export default function TopicClient({
       </div>
 
       <p className="text-xs text-gray-400 mt-4">
-        Нажми на название модуля или занятия — чтобы переименовать.
+        Нажми на название модуля — чтобы переименовать. У занятий — иконка ✎ при наведении.
       </p>
     </div>
   )

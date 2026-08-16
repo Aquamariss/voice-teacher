@@ -41,10 +41,12 @@ export default function DisciplineClient({
   discipline,
   topics: initialTopics,
   practiceTasks,
+  progress,
 }: {
   discipline: Discipline
   topics: Topic[]
   practiceTasks: PracticeTaskWithResult[]
+  progress: Record<string, { total: number; completed: number }>
 }) {
   const router = useRouter()
   const [topics, setTopics] = useState<Topic[]>(initialTopics)
@@ -135,14 +137,15 @@ export default function DisciplineClient({
 
       {/* Таблица тем */}
       <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+        <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-100 bg-gray-50">
               <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 w-8">#</th>
-              <th className="text-left px-4 py-3 text-xs font-medium text-gray-500">Тема</th>
-              <th className="text-left px-4 py-3 text-xs font-medium text-gray-500">Сложность</th>
-              <th className="text-left px-4 py-3 text-xs font-medium text-gray-500">Глубина</th>
-              <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 whitespace-nowrap">Длит. занятия</th>
+              <th className="text-left px-4 py-3 text-xs font-medium text-gray-500">
+                <span className="block">Тема</span>
+                <span className="block font-normal text-gray-400">Сложность / глубина / длительность</span>
+              </th>
               <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 w-16">Статус</th>
               <th className="w-8 px-2"></th>
             </tr>
@@ -160,7 +163,7 @@ export default function DisciplineClient({
                   {/* # */}
                   <td className="px-4 py-3 text-gray-400">{i + 1}</td>
 
-                  {/* Название */}
+                  {/* Название + параметры */}
                   <td className="px-4 py-3">
                     {isEditing(topic.id, 'name') ? (
                       <input
@@ -191,88 +194,85 @@ export default function DisciplineClient({
                         )}
                       </span>
                     )}
-                  </td>
-
-                  {/* Сложность */}
-                  <td className="px-4 py-3">
-                    {isEditing(topic.id, 'complexity') ? (
-                      <select
-                        autoFocus
-                        value={topic.complexity}
-                        onChange={e => {
-                          updateTopicLocal(topic.id, 'complexity', e.target.value)
-                          const updated = { ...topic, complexity: e.target.value as Complexity }
-                          setTopics(prev => prev.map(t => t.id === updated.id ? updated : t))
-                          saveTopic(updated)
-                        }}
-                        className="border border-gray-200 rounded px-1 py-0.5 text-xs outline-none"
-                      >
-                        {complexityOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                      </select>
-                    ) : (
-                      <span
-                        className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${complexityColor[topic.complexity]} ${canEdit ? 'cursor-pointer' : ''}`}
-                        onClick={() => canEdit && setEditing({ topicId: topic.id, field: 'complexity' })}
-                      >
-                        {complexityOptions.find(o => o.value === topic.complexity)?.label}
-                      </span>
-                    )}
-                  </td>
-
-                  {/* Глубина */}
-                  <td className="px-4 py-3">
-                    {isEditing(topic.id, 'depth') ? (
-                      <select
-                        autoFocus
-                        value={topic.depth}
-                        onChange={e => {
-                          const updated = { ...topic, depth: e.target.value as Depth }
-                          setTopics(prev => prev.map(t => t.id === updated.id ? updated : t))
-                          saveTopic(updated)
-                        }}
-                        className="border border-gray-200 rounded px-1 py-0.5 text-xs outline-none"
-                      >
-                        {depthOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                      </select>
-                    ) : (
-                      <span
-                        className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${depthColor[topic.depth]} ${canEdit ? 'cursor-pointer' : ''}`}
-                        onClick={() => canEdit && setEditing({ topicId: topic.id, field: 'depth' })}
-                      >
-                        {depthOptions.find(o => o.value === topic.depth)?.label}
-                      </span>
-                    )}
-                  </td>
-
-                  {/* Длительность */}
-                  <td className="px-4 py-3">
-                    {isEditing(topic.id, 'duration') ? (
-                      <input
-                        autoFocus
-                        type="number"
-                        min={5}
-                        max={120}
-                        value={topic.lesson_duration_minutes}
-                        onChange={e => updateTopicLocal(topic.id, 'lesson_duration_minutes', Number(e.target.value))}
-                        onBlur={() => saveTopic(topic)}
-                        onKeyDown={e => e.key === 'Enter' && saveTopic(topic)}
-                        className="w-16 border-b border-blue-400 outline-none bg-transparent text-center"
-                      />
-                    ) : (
-                      <span
-                        className={`text-gray-600 ${canEdit ? 'cursor-pointer hover:text-blue-700' : ''}`}
-                        onClick={() => canEdit && setEditing({ topicId: topic.id, field: 'duration' })}
-                      >
-                        {topic.lesson_duration_minutes} мин
-                      </span>
-                    )}
+                    <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                      {isEditing(topic.id, 'complexity') ? (
+                        <select
+                          autoFocus
+                          value={topic.complexity}
+                          onChange={e => {
+                            const updated = { ...topic, complexity: e.target.value as Complexity }
+                            setTopics(prev => prev.map(t => t.id === updated.id ? updated : t))
+                            saveTopic(updated)
+                          }}
+                          className="border border-gray-200 rounded px-1 py-0.5 text-xs outline-none"
+                        >
+                          {complexityOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      ) : (
+                        <span
+                          className={`inline-block px-1.5 py-0.5 rounded-full text-xs font-medium ${complexityColor[topic.complexity]} ${canEdit ? 'cursor-pointer' : ''}`}
+                          onClick={() => canEdit && setEditing({ topicId: topic.id, field: 'complexity' })}
+                        >
+                          {complexityOptions.find(o => o.value === topic.complexity)?.label}
+                        </span>
+                      )}
+                      <span className="text-gray-300 text-xs">/</span>
+                      {isEditing(topic.id, 'depth') ? (
+                        <select
+                          autoFocus
+                          value={topic.depth}
+                          onChange={e => {
+                            const updated = { ...topic, depth: e.target.value as Depth }
+                            setTopics(prev => prev.map(t => t.id === updated.id ? updated : t))
+                            saveTopic(updated)
+                          }}
+                          className="border border-gray-200 rounded px-1 py-0.5 text-xs outline-none"
+                        >
+                          {depthOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      ) : (
+                        <span
+                          className={`inline-block px-1.5 py-0.5 rounded-full text-xs font-medium ${depthColor[topic.depth]} ${canEdit ? 'cursor-pointer' : ''}`}
+                          onClick={() => canEdit && setEditing({ topicId: topic.id, field: 'depth' })}
+                        >
+                          {depthOptions.find(o => o.value === topic.depth)?.label}
+                        </span>
+                      )}
+                      <span className="text-gray-300 text-xs">/</span>
+                      {isEditing(topic.id, 'duration') ? (
+                        <input
+                          autoFocus
+                          type="number"
+                          min={5}
+                          max={120}
+                          value={topic.lesson_duration_minutes}
+                          onChange={e => updateTopicLocal(topic.id, 'lesson_duration_minutes', Number(e.target.value))}
+                          onBlur={() => saveTopic(topic)}
+                          onKeyDown={e => e.key === 'Enter' && saveTopic(topic)}
+                          className="w-14 border-b border-blue-400 outline-none bg-transparent text-center text-xs"
+                        />
+                      ) : (
+                        <span
+                          className={`text-xs text-gray-400 ${canEdit ? 'cursor-pointer hover:text-blue-600' : ''}`}
+                          onClick={() => canEdit && setEditing({ topicId: topic.id, field: 'duration' })}
+                        >
+                          {topic.lesson_duration_minutes} мин
+                        </span>
+                      )}
+                    </div>
                   </td>
 
                   {/* Статус */}
                   <td className="px-4 py-3">
-                    {topic.status === 'completed' && <span className="text-xs text-green-600 font-medium">✓ Готово</span>}
-                    {topic.status === 'in_progress' && <span className="text-xs text-blue-600 font-medium">В процессе</span>}
-                    {topic.status === 'pending' && <span className="text-xs text-gray-400">—</span>}
+                    {(() => {
+                      const p = progress[topic.id]
+                      if (!p || p.total === 0) return <span className="text-xs text-gray-400">—</span>
+                      if (p.completed === p.total)
+                        return <span className="text-xs font-medium text-green-600">✓ {p.completed}/{p.total}</span>
+                      if (p.completed > 0)
+                        return <span className="text-xs font-medium text-blue-600">{p.completed}/{p.total}</span>
+                      return <span className="text-xs text-gray-400">0/{p.total}</span>
+                    })()}
                   </td>
 
                   {/* Удалить */}
@@ -292,6 +292,7 @@ export default function DisciplineClient({
             })}
           </tbody>
         </table>
+        </div>
 
         {topics.length === 0 && (
           <div className="px-4 py-8 text-center text-gray-400 text-sm">
@@ -301,7 +302,7 @@ export default function DisciplineClient({
       </div>
 
       <p className="text-xs text-gray-400 mt-3">
-        Нажми на название, сложность, глубину или длительность — чтобы изменить. Завершённые темы не редактируются.
+        Нажми на параметр темы — чтобы изменить. Завершённые темы не редактируются.
       </p>
 
       <PracticeModule

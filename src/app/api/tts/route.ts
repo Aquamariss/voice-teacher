@@ -10,14 +10,16 @@ export async function POST(request: Request) {
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return new Response('Unauthorized', { status: 401 })
 
-  const { text } = await request.json() as { text: string }
+  const { text, voiceId } = await request.json() as { text: string; voiceId?: string }
   if (!text?.trim()) return new Response('No text', { status: 400 })
 
+  const effectiveVoiceId = voiceId?.trim() || VOICE_ID
+
   const t0 = Date.now()
-  console.log(`[tts] → ElevenLabs, chars=${text.length}`)
+  console.log(`[tts] → ElevenLabs, chars=${text.length}, voice=${effectiveVoiceId}`)
 
   const res = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream`,
+    `https://api.elevenlabs.io/v1/text-to-speech/${effectiveVoiceId}/stream`,
     {
       method: 'POST',
       headers: {

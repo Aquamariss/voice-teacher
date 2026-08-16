@@ -6,9 +6,11 @@ import { useVoice } from '@/lib/voice/VoiceContext'
 import { type AgentStructure, type Discipline, type Topic } from '@/types/db'
 import { SPEEDS, SPEED_KEY, getSavedSpeed } from '@/lib/playback-speed'
 import { PartText } from '@/components/PartContent'
+import { getVoiceId } from '@/lib/voice/voiceSettings'
+import WikiCarousel, { type WikiImage } from '@/components/WikiCarousel'
 
 type Role       = 'user' | 'assistant'
-type Message    = { role: Role; content: string }
+type Message    = { role: Role; content: string; images?: WikiImage[] }
 type PanelState = 'collapsed' | 'open'
 type PanelMode  = 'assistant' | 'new-discipline' | 'edit-discipline' | 'topic-structure'
 
@@ -207,7 +209,7 @@ export default function AssistantPanel() {
     try {
       const res = await fetch('/api/tts', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, voiceId: getVoiceId() }),
       })
       if (!res.ok || !voice.isActive) { voice.setBusy(false); return }
       const blob = await res.blob()
@@ -745,6 +747,12 @@ export default function AssistantPanel() {
               u[u.length - 1] = { role: 'assistant', content: fullText }
               return u
             })
+          } else if (event === 'wiki_images') {
+            setMessages(prev => {
+              const u = [...prev]
+              u[u.length - 1] = { ...u[u.length - 1], images: data.images }
+              return u
+            })
           } else if (event === 'navigate') {
             const { page, discipline_id, topic_id } = data as {
               page: string; discipline_id?: string; topic_id?: string
@@ -768,7 +776,7 @@ export default function AssistantPanel() {
       setMessages(prev => {
         const u = [...prev]
         if (fullText && u[u.length - 1].role === 'assistant')
-          u[u.length - 1] = { role: 'assistant', content: fullText }
+          u[u.length - 1] = { ...u[u.length - 1], content: fullText }
         return u
       })
 
@@ -982,7 +990,12 @@ export default function AssistantPanel() {
               }`}>
                 {msg.role === 'assistant'
                   ? msg.content
-                    ? <PartText content={msg.content} />
+                    ? <>
+                        <PartText content={msg.content} />
+                        {msg.images && msg.images.length > 0 && (
+                          <WikiCarousel images={msg.images} />
+                        )}
+                      </>
                     : (
                       <span className="inline-flex gap-1 items-center text-gray-400">
                         <span className="animate-bounce">·</span>

@@ -2,6 +2,7 @@ import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
 import { type Discipline } from '@/types/db'
 import NewDisciplineCard from '@/components/NewDisciplineCard'
+import VoiceSettings from '@/components/VoiceSettings'
 
 async function getDisciplines(): Promise<Discipline[]> {
   const supabase = await createClient()
@@ -54,6 +55,8 @@ export default async function DashboardPage() {
 
         <NewDisciplineCard />
       </div>
+
+      <VoiceSettings />
     </div>
   )
 }

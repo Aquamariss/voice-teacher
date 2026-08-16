@@ -40,10 +40,40 @@ async function getData(disciplineId: string) {
     return { ...task, result: latest }
   })
 
+  // Build lesson progress per topic: topicId → { total, completed }
+  const topicIds = (topics ?? []).map(t => t.id)
+  const progress: Record<string, { total: number; completed: number }> = {}
+  for (const id of topicIds) progress[id] = { total: 0, completed: 0 }
+
+  if (topicIds.length > 0) {
+    const { data: modules } = await supabase
+      .from('modules')
+      .select('id, topic_id')
+      .in('topic_id', topicIds)
+
+    const moduleIds = (modules ?? []).map(m => m.id)
+    const moduleToTopic = Object.fromEntries((modules ?? []).map(m => [m.id, m.topic_id]))
+
+    if (moduleIds.length > 0) {
+      const { data: lessons } = await supabase
+        .from('lessons')
+        .select('module_id, status')
+        .in('module_id', moduleIds)
+
+      for (const lesson of lessons ?? []) {
+        const topicId = moduleToTopic[lesson.module_id]
+        if (!topicId) continue
+        progress[topicId].total++
+        if (lesson.status === 'completed') progress[topicId].completed++
+      }
+    }
+  }
+
   return {
     discipline,
     topics: (topics ?? []) as Topic[],
     practiceTasks: tasksWithResults,
+    progress,
   }
 }
 
@@ -53,12 +83,13 @@ export default async function DisciplinePage({
   params: Promise<{ disciplineId: string }>
 }) {
   const { disciplineId } = await params
-  const { discipline, topics, practiceTasks } = await getData(disciplineId)
+  const { discipline, topics, practiceTasks, progress } = await getData(disciplineId)
   return (
     <DisciplineClient
       discipline={discipline}
       topics={topics}
       practiceTasks={practiceTasks}
+      progress={progress}
     />
   )
 }

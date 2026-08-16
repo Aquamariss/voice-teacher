@@ -3,6 +3,7 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 import { createClient } from '@/lib/supabase/server'
 import { assembleContext, type PageContext } from '@/lib/context/assembleContext'
+import { searchWikipediaArticles } from '@/lib/wikipedia'
 
 export const maxDuration = 120
 
@@ -58,6 +59,18 @@ const tools: Anthropic.Tool[] = [
         },
       },
       required: ['mode', 'topicId'],
+    },
+  },
+  {
+    name: 'search_wikipedia',
+    description: 'Поиск статей в Википедии по запросу пользователя. Возвращает список статей с заголовком, URL и описанием. Используй когда пользователь просит найти информацию, ссылки или иллюстрации по теме.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Поисковый запрос' },
+        language: { type: 'string', description: 'Код языка Википедии: ru, en, es, fr, de. Выбирай исходя из контекста — по умолчанию ru.' },
+      },
+      required: ['query'],
     },
   },
   {
@@ -159,7 +172,26 @@ export async function POST(request: Request) {
         if (msg.stop_reason === 'tool_use') {
           const toolUse = msg.content.find(b => b.type === 'tool_use')
           if (toolUse?.type === 'tool_use') {
-            if (toolUse.name === 'navigate') {
+            if (toolUse.name === 'search_wikipedia') {
+              const { query, language = 'ru' } = toolUse.input as { query: string; language?: string }
+              const articles = await searchWikipediaArticles(query, language)
+
+              const resultsText = articles.length === 0
+                ? '\n\nПо запросу ничего не нашлось в Википедии.'
+                : '\n\n' + articles.map((a, i) => {
+                    const desc = a.description ? `\n${a.description}` : ''
+                    return `**${i + 1}. ${a.title}**\n${a.url}${desc}`
+                  }).join('\n\n')
+
+              send('text', { text: resultsText })
+
+              const images = articles
+                .filter(a => a.thumbnail)
+                .slice(0, 3)
+                .map(a => ({ title: a.title, url: a.url, thumbnail: a.thumbnail! }))
+              if (images.length > 0) send('wiki_images', { images })
+
+            } else if (toolUse.name === 'navigate') {
               send('navigate', toolUse.input)
             } else if (toolUse.name === 'switch_mode') {
               send('switch_mode', toolUse.input)

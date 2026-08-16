@@ -96,6 +96,47 @@ async function getArticleImage(pageTitle: string): Promise<LessonImage | null> {
   }
 }
 
+export interface WikiSearchResult {
+  title: string
+  url: string
+  description: string | null
+  thumbnail: string | null
+}
+
+export async function searchWikipediaArticles(
+  query: string,
+  lang = 'ru',
+  limit = 4,
+): Promise<WikiSearchResult[]> {
+  try {
+    const url = `https://${lang}.wikipedia.org/w/rest.php/v1/search/page?q=${encodeURIComponent(query)}&limit=${limit}`
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) return []
+
+    const data = await res.json() as {
+      pages: Array<{
+        key: string
+        title: string
+        description?: string
+        excerpt?: string
+        thumbnail?: { url: string }
+      }>
+    }
+
+    return (data.pages ?? []).map(p => ({
+      title: p.title,
+      url: `https://${lang}.wikipedia.org/wiki/${p.key}`,
+      description: p.description ?? p.excerpt?.replace(/<[^>]+>/g, '') ?? null,
+      thumbnail: p.thumbnail?.url ? `https:${p.thumbnail.url}` : null,
+    }))
+  } catch {
+    return []
+  }
+}
+
 export async function fetchWikipediaImages(
   wikipediaTitle: string,
   limit = 1

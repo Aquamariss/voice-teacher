@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { SPEEDS, SPEED_KEY, getSavedSpeed } from '@/lib/playback-speed'
+import { getVoiceId } from '@/lib/voice/voiceSettings'
 
 interface AudioPlayerProps {
   title: string
@@ -86,7 +87,7 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     const res = await fetch('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: chunkText }),
+      body: JSON.stringify({ text: chunkText, voiceId: getVoiceId() }),
     })
     if (!res.ok || !res.body) {
       const body = await res.text().catch(() => '')
@@ -161,7 +162,7 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
         const res = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: chunks[i] }),
+          body: JSON.stringify({ text: chunks[i], voiceId: getVoiceId() }),
         })
         if (!res.ok || cancelledRef.current) break
         const blob = await res.blob()
