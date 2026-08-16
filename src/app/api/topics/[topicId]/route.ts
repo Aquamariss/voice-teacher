@@ -13,7 +13,7 @@ export async function GET(
   // Проверяем что тема принадлежит пользователю через discipline
   const { data: topic } = await supabase
     .from('topics')
-    .select('*, discipline:disciplines!inner(user_id)')
+    .select('*, discipline:disciplines!inner(user_id, name)')
     .eq('id', topicId)
     .eq('disciplines.user_id', user.id)
     .single()

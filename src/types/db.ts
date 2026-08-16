@@ -73,6 +73,44 @@ export interface Module {
   created_at: string
 }
 
+export interface QuizLevel1Question {
+  id: number
+  question: string
+  answer: string
+}
+
+export interface QuizLevel2Question {
+  id: number
+  question: string
+  key_points: string[]
+}
+
+export interface QuizData {
+  level1: QuizLevel1Question[]
+  level2: QuizLevel2Question[]
+}
+
+export interface QuizResultItem {
+  id: number
+  question: string
+  user_answer: string
+  feedback: string
+  correct?: boolean
+  correct_answer?: string
+  score?: number
+  key_points?: string[]
+}
+
+export interface QuizResults {
+  completed_at: string
+  level1_score: number
+  level1_total: number
+  level2_score: number
+  level2_total: number
+  level1: QuizResultItem[]
+  level2: QuizResultItem[]
+}
+
 export interface Lesson {
   id: string
   module_id: string
@@ -81,7 +119,20 @@ export interface Lesson {
   order_idx: number
   status: LessonStatus
   content_outline: string | null
+  quiz_data: QuizData | null
+  quiz_results: QuizResults | null
   created_at: string
+}
+
+export interface LessonImage {
+  query: string         // заголовок статьи Wikipedia, по которой нашли картинку
+  title: string         // название файла изображения
+  thumbnail_url: string
+  full_url: string
+  author: string
+  license: string
+  source_page_url: string
+  description?: string  // краткое описание из Wikidata / первое предложение статьи
 }
 
 export interface LessonPart {
@@ -90,6 +141,7 @@ export interface LessonPart {
   part_number: number
   content: string | null
   status: PartStatus
+  images: LessonImage[] | null
   created_at: string
 }
 
@@ -99,6 +151,36 @@ export interface LessonWithParts extends Lesson {
 
 export interface ModuleWithLessons extends Module {
   lessons: LessonWithParts[]
+}
+
+// ── Практический модуль ─────────────────────────────────────────────────────
+
+export type PracticeTaskType = 'case_study' | 'calculation'
+
+export interface PracticeTask {
+  id: string
+  discipline_id: string
+  task_number: number
+  title: string
+  content: string
+  task_type: PracticeTaskType
+  image_url: string | null
+  image_attribution: string | null
+  model_answer: string
+  created_at: string
+}
+
+export interface PracticeResult {
+  id: string
+  task_id: string
+  user_response: string
+  score: number
+  feedback: string
+  submitted_at: string
+}
+
+export interface PracticeTaskWithResult extends PracticeTask {
+  result: PracticeResult | null
 }
 
 // Структура из агента (до сохранения в БД)

@@ -9,6 +9,8 @@ export interface PageContext {
 export interface AssembledContext {
   learner: string        // компактный текст для промпта
   discipline: string     // память дисциплины (пустая строка если не в дисциплине)
+  topicStructure: string // модули и занятия текущей темы (пустая строка если не в теме)
+  quizContext: string    // вопросы текущего занятия (пустая строка если нет)
 }
 
 /**
@@ -68,7 +70,48 @@ export async function assembleContext(
     }
   }
 
-  return { learner, discipline }
+  // ── Структура текущей темы ───────────────────────────────────────────────
+  let topicStructure = ''
+  if (page?.topicId) {
+    const { data: modulesData } = await supabase
+      .from('modules')
+      .select('id, name, order_idx, lessons(id, name, description, order_idx, status)')
+      .eq('topic_id', page.topicId)
+      .order('order_idx')
+
+    if (modulesData?.length) {
+      topicStructure = modulesData.map((mod: {
+        name: string
+        order_idx: number
+        lessons: Array<{ name: string; description: string | null; order_idx: number; status: string }>
+      }) => {
+        const lessons = (mod.lessons ?? [])
+          .sort((a, b) => a.order_idx - b.order_idx)
+          .map((l, i) => `  Занятие ${i + 1}: ${l.name}${l.description ? ` — ${l.description}` : ''} [${l.status}]`)
+          .join('\n')
+        return `Модуль: ${mod.name}\n${lessons}`
+      }).join('\n\n')
+    }
+  }
+
+  // ── Квиз текущего занятия ────────────────────────────────────────────────
+  let quizContext = ''
+  if (page?.lessonId) {
+    const { data: lessonData } = await supabase
+      .from('lessons')
+      .select('name, quiz_data')
+      .eq('id', page.lessonId)
+      .single()
+
+    if (lessonData?.quiz_data) {
+      const qd = lessonData.quiz_data as { level1?: Array<{ id: number; question: string; answer: string }>; level2?: Array<{ id: number; question: string; key_points: string[] }> }
+      const l1 = (qd.level1 ?? []).map(q => `  ${q.id}. ${q.question}\n     Ответ: ${q.answer}`).join('\n')
+      const l2 = (qd.level2 ?? []).map(q => `  ${q.id}. ${q.question}\n     Ключевые идеи: ${q.key_points.join('; ')}`).join('\n')
+      quizContext = `Занятие: «${lessonData.name}»\n\nУровень 1 (воспроизведение):\n${l1}\n\nУровень 2 (критическое мышление):\n${l2}`
+    }
+  }
+
+  return { learner, discipline, topicStructure, quizContext }
 }
 
 /**

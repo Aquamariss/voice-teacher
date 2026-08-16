@@ -3,7 +3,8 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { type Discipline, type Topic, type Complexity, type Depth } from '@/types/db'
+import { type Discipline, type Topic, type Complexity, type Depth, type PracticeTaskWithResult } from '@/types/db'
+import PracticeModule from '@/components/PracticeModule'
 
 const complexityOptions: { value: Complexity; label: string }[] = [
   { value: 'easy', label: 'Лёгкая' },
@@ -39,9 +40,11 @@ interface EditState {
 export default function DisciplineClient({
   discipline,
   topics: initialTopics,
+  practiceTasks,
 }: {
   discipline: Discipline
   topics: Topic[]
+  practiceTasks: PracticeTaskWithResult[]
 }) {
   const router = useRouter()
   const [topics, setTopics] = useState<Topic[]>(initialTopics)
@@ -91,6 +94,8 @@ export default function DisciplineClient({
 
   const isEditing = (topicId: string, field: EditableField) =>
     editing?.topicId === topicId && editing?.field === field
+
+  const allTopicsCompleted = topics.length > 0 && topics.every(t => t.status === 'completed')
 
   return (
     <div>
@@ -298,6 +303,12 @@ export default function DisciplineClient({
       <p className="text-xs text-gray-400 mt-3">
         Нажми на название, сложность, глубину или длительность — чтобы изменить. Завершённые темы не редактируются.
       </p>
+
+      <PracticeModule
+        disciplineId={discipline.id}
+        allTopicsCompleted={allTopicsCompleted}
+        initialTasks={practiceTasks}
+      />
     </div>
   )
 }

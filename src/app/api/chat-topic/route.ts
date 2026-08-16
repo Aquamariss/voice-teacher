@@ -18,11 +18,16 @@ export async function POST(request: Request) {
   if (!user) return new Response('Unauthorized', { status: 401 })
 
   // topicContext: { disciplineName, topicName, complexity, depth, lesson_duration_minutes }
-  const { messages, topicContext } = await request.json()
+  // existingStructure: [{ name, lessons: [{ name, description }] }] — если тема уже имеет структуру
+  const { messages, topicContext, existingStructure } = await request.json()
 
-  const systemPrompt = topicContext
-    ? `${basePrompt}\n\n## Данные темы\n\n\`\`\`json\n${JSON.stringify(topicContext, null, 2)}\n\`\`\``
-    : basePrompt
+  let systemPrompt = basePrompt
+  if (topicContext) {
+    systemPrompt += `\n\n## Данные темы\n\n\`\`\`json\n${JSON.stringify(topicContext, null, 2)}\n\`\`\``
+  }
+  if (existingStructure?.length) {
+    systemPrompt += `\n\n## Текущая структура темы\n\nПользователь редактирует уже существующую структуру. Работай именно с ней — не придумывай новую. Текущие модули и занятия:\n\n\`\`\`json\n${JSON.stringify(existingStructure, null, 2)}\n\`\`\``
+  }
 
   const encoder = new TextEncoder()
 
