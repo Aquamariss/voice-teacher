@@ -203,4 +203,5 @@ src/
     api/practice/[taskId]/submit/      — оценка практического ответа
     (dashboard)/layout.tsx             — dashboard layout
   proxy.ts                             — auth guard (НЕ middleware.ts)
+
 ```
