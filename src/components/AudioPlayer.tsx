@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { SPEEDS, SPEED_KEY, getSavedSpeed } from '@/lib/playback-speed'
 import { getVoiceId } from '@/lib/voice/voiceSettings'
+import { vlog, vwarn, verr } from '@/lib/voice/debugLog'
 
 interface AudioPlayerProps {
   title: string
@@ -207,10 +208,12 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
       if (isFinite(audio.duration) && !cancelledRef.current) setDuration(audio.duration)
     })
     audio.addEventListener('playing', () => {
+      vlog('лекция: играет')
       window.dispatchEvent(new CustomEvent('voice:lecture-playing'))
       if (!cancelledRef.current) setState('playing')
     })
     audio.addEventListener('pause', () => {
+      vlog('лекция: пауза')
       window.dispatchEvent(new CustomEvent('voice:lecture-paused'))
       if (!cancelledRef.current) setState(s => s !== 'done' ? 'paused' : 'done')
     })
@@ -344,10 +347,26 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
   useEffect(() => {
     startStream()
 
-    // Голос обнаружен — ставим на паузу (не стоп), чтобы можно было возобновить
+    // Голос обнаружен — ставим на паузу (не стоп), чтобы можно было возобновить.
+    // userPausedRef не трогаем: пауза временная, цикл чанков должен продолжить
     const handleVoiceInterrupt = () => { audioRef.current?.pause() }
-    const handleStopLecture    = () => { audioRef.current?.pause() }
-    const handleResumeLecture  = () => { audioRef.current?.play().catch(() => {}) }
+
+    // Явная команда «стоп» — это уже осознанная пауза пользователя
+    const handleStopLecture = () => {
+      userPausedRef.current = true
+      audioRef.current?.pause()
+    }
+
+    const handleResumeLecture = () => {
+      const audio = audioRef.current
+      if (!audio) { vwarn('resume: плеера уже нет'); return }
+      // Снимаем ручную паузу, иначе fallbackBlobChunks не запустит
+      // следующий фрагмент и лекция встанет после текущего
+      userPausedRef.current = false
+      audio.play()
+        .then(() => vlog('resume: лекция продолжилась'))
+        .catch((e: Error) => verr(`resume: play() отклонён (${e.name})`, e.message))
+    }
 
     const handleChangeSpeed = (e: Event) => {
       const { direction } = (e as CustomEvent<{ direction: 'slower' | 'faster' }>).detail

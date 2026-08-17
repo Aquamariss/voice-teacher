@@ -150,11 +150,6 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   const lastRecoverAtRef   = useRef(0)
   const vadReadyAtRef      = useRef(0)
   const voiceStatusRef     = useRef<VoiceStatus>('idle')
-  // Играла ли лекция в момент СТАРТА записи. Проверять флаг позже нельзя:
-  // beginRecording сам ставит лекцию на паузу, и к моменту разбора команды
-  // он всегда false — из-за этого фильтр «во время лекции только стоп-слова»
-  // фактически не работал, и звук лекции уходил ассистенту как вопрос.
-  const wasLecturePlayingRef = useRef(false)
   const recorderRef        = useRef<MediaRecorder | null>(null)
   const recorderMimeRef    = useRef('')
   const chunksRef          = useRef<Blob[]>([])
@@ -414,8 +409,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       busyRef.current = false
     }
 
-    // Снимаем ДО паузы: событие ниже само сбросит isLecturePlayingRef
-    wasLecturePlayingRef.current = isLecturePlayingRef.current
+    if (isLecturePlayingRef.current) vlog('запись поверх лекции — ставим её на паузу')
 
     window.dispatchEvent(new CustomEvent('voice:interrupt-audio'))
 
@@ -509,29 +503,20 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         return
       }
 
-      // ── РЕЖИМ ЛЕКЦИИ (лекция воспроизводится) ───────────────────────────
-      // Принимаем только стоп-команды; всё остальное — тихо игнорируем.
-      // Это защищает от фантомных сообщений из-за фонового шума и звука лекции.
-      if (wasLecturePlayingRef.current) {
-        if (tokenMatchesAny(normalized, STOP_WORDS)) {
-          vlog('cmd: стоп-лекция')
-          window.dispatchEvent(new CustomEvent('voice:stop-lecture'))
-          // AudioPlayer выдаст voice:lecture-paused → isLecturePlayingRef = false
-          busyRef.current = false
-          if (isActiveRef.current) setVoiceStatus('listening')
-          restartVADAfter(800)
-        } else {
-          // Ложное срабатывание на звук самой лекции: мы её уже поставили на
-          // паузу в beginRecording, поэтому возвращаем обратно
-          vlog('lecture-mode: не команда — возобновляем лекцию')
-          busyRef.current = false
-          if (isActiveRef.current) setVoiceStatus('listening')
-          window.dispatchEvent(new CustomEvent('voice:resume-lecture'))
-        }
+      // ── СТОП-КОМАНДА — работает в любом режиме ──────────────────────────
+      if (tokenMatchesAny(normalized, STOP_WORDS)) {
+        vlog('cmd: стоп-лекция')
+        window.dispatchEvent(new CustomEvent('voice:stop-lecture'))
+        busyRef.current = false
+        if (isActiveRef.current) setVoiceStatus('listening')
+        restartVADAfter(800)
         return
       }
 
-      // ── РЕЖИМ ДИАЛОГА (лекция на паузе или не запущена) ─────────────────
+      // Отдельного «режима лекции» больше нет: раньше во время лекции всё,
+      // кроме стоп-слов, отбрасывалось — и живые вопросы тоже. От фантомных
+      // срабатываний защищаемся не здесь, а на входе: прогрев после включения
+      // микрофона и повышенная планка, пока что-то звучит из динамика.
 
       // Команда «продолжи» — возобновляем лекцию, ассистента не трогаем.
       // Сначала короткое голосовое подтверждение: без него на слух непонятно,
