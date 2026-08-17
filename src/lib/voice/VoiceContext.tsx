@@ -52,6 +52,16 @@ const RECORDER_BITRATE = 32000 // бит/с; речи хватает, а зал�
 // оставляет MediaStream живым, но выдаёт нули.
 const DEAD_SIGNAL_LEVEL = 0.3
 const DEAD_SIGNAL_MS    = 5000
+// Каждый перезахват заново переключает аудиосессию iOS: всплывает системная
+// плашка «микрофон активен» и скачком меняется громкость динамика. Поэтому
+// перезахват — крайняя мера, не чаще раза в полминуты.
+const RECOVER_COOLDOWN_MS = 30000
+
+// Пауза после включения микрофона, прежде чем VAD получает право сработать.
+// В первые мгновения после переключения аудиосессии эхоподавление ещё не
+// сошлось, и звук собственной лекции из динамика прилетает на вход почти
+// без ослабления — в логе это пик 74 при пороге 42.
+const VAD_WARMUP_MS = 1800
 
 // Односэмпловый беззвучный WAV. Проигрывается по клику, чтобы «разблокировать»
 // аудио-элемент — после этого iOS разрешает play() из асинхронного кода.
@@ -137,7 +147,14 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   const analyserRef        = useRef<AnalyserNode | null>(null)
   const recoveringRef      = useRef(false)
   const deadSinceRef       = useRef(0)
+  const lastRecoverAtRef   = useRef(0)
+  const vadReadyAtRef      = useRef(0)
   const voiceStatusRef     = useRef<VoiceStatus>('idle')
+  // Играла ли лекция в момент СТАРТА записи. Проверять флаг позже нельзя:
+  // beginRecording сам ставит лекцию на паузу, и к моменту разбора команды
+  // он всегда false — из-за этого фильтр «во время лекции только стоп-слова»
+  // фактически не работал, и звук лекции уходил ассистенту как вопрос.
+  const wasLecturePlayingRef = useRef(false)
   const recorderRef        = useRef<MediaRecorder | null>(null)
   const recorderMimeRef    = useRef('')
   const chunksRef          = useRef<Blob[]>([])
@@ -264,12 +281,20 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         lastReport = Date.now()
       }
 
+      const speaking  = voiceStatusRef.current === 'speaking'
+      // Пока что-то звучит из динамика, эхоподавление iOS намеренно давит
+      // вход почти до нуля. Это не обрыв потока, и перезахватывать нельзя:
+      // каждый перезахват даёт скачок громкости и системную плашку.
+      const playingOut = speaking || isLecturePlayingRef.current
+      const warmedUp   = Date.now() >= vadReadyAtRef.current
+
       // ── Детектор мёртвого потока ──────────────────────────────────────
       // Смена Bluetooth-профиля оставляет трек «живым», но данные — нули.
-      if (energy < DEAD_SIGNAL_LEVEL) {
+      if (energy < DEAD_SIGNAL_LEVEL && !playingOut && warmedUp) {
         if (deadSinceRef.current === 0) deadSinceRef.current = Date.now()
         else if (
           Date.now() - deadSinceRef.current > DEAD_SIGNAL_MS &&
+          Date.now() - lastRecoverAtRef.current > RECOVER_COOLDOWN_MS &&
           !isRecordingRef.current && !recoveringRef.current
         ) {
           deadSinceRef.current = 0
@@ -282,9 +307,10 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       // ── Старт записи ──────────────────────────────────────────────────
       // Во время речи ассистента запись разрешена — это перебивание, но с
       // повышенной планкой, чтобы его собственный голос её не запускал.
-      const speaking     = voiceStatusRef.current === 'speaking'
-      const framesNeeded = speaking ? BARGE_IN_FRAMES : MIN_VOICE_FRAMES
-      const mayRecord    = !isRecordingRef.current && (!busyRef.current || speaking)
+      // Во время лекции планка такая же: иначе её собственный звук из
+      // динамика запускает запись сам.
+      const framesNeeded = playingOut ? BARGE_IN_FRAMES : MIN_VOICE_FRAMES
+      const mayRecord    = warmedUp && !isRecordingRef.current && (!busyRef.current || speaking)
 
       if (aboveStart) {
         voiceFramesRef.current++
@@ -331,7 +357,10 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
   async function recoverMic() {
     if (recoveringRef.current || !isActiveRef.current) return
-    recoveringRef.current = true
+    recoveringRef.current  = true
+    lastRecoverAtRef.current = Date.now()
+    // Перезахват снова переключит аудиосессию — даём эхоподавлению сойтись
+    vadReadyAtRef.current  = Date.now() + VAD_WARMUP_MS
     vwarn('mic: сигнал пропал — перезахватываем поток')
 
     try {
@@ -384,6 +413,9 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       vlog('перебивание: останавливаем ответ ассистента')
       busyRef.current = false
     }
+
+    // Снимаем ДО паузы: событие ниже само сбросит isLecturePlayingRef
+    wasLecturePlayingRef.current = isLecturePlayingRef.current
 
     window.dispatchEvent(new CustomEvent('voice:interrupt-audio'))
 
@@ -480,7 +512,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       // ── РЕЖИМ ЛЕКЦИИ (лекция воспроизводится) ───────────────────────────
       // Принимаем только стоп-команды; всё остальное — тихо игнорируем.
       // Это защищает от фантомных сообщений из-за фонового шума и звука лекции.
-      if (isLecturePlayingRef.current) {
+      if (wasLecturePlayingRef.current) {
         if (tokenMatchesAny(normalized, STOP_WORDS)) {
           vlog('cmd: стоп-лекция')
           window.dispatchEvent(new CustomEvent('voice:stop-lecture'))
@@ -489,9 +521,12 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
           if (isActiveRef.current) setVoiceStatus('listening')
           restartVADAfter(800)
         } else {
-          vlog('lecture-mode: не команда — игнорируем')
+          // Ложное срабатывание на звук самой лекции: мы её уже поставили на
+          // паузу в beginRecording, поэтому возвращаем обратно
+          vlog('lecture-mode: не команда — возобновляем лекцию')
           busyRef.current = false
           if (isActiveRef.current) setVoiceStatus('listening')
+          window.dispatchEvent(new CustomEvent('voice:resume-lecture'))
         }
         return
       }
@@ -574,6 +609,10 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     busyRef.current      = false
     vadActiveRef.current = false
     deadSinceRef.current = 0
+    lastRecoverAtRef.current = 0
+    // Включение микрофона переводит аудиосессию iOS в режим записи: громкость
+    // динамика скачком меняется, а эхоподавление первые секунды не справляется
+    vadReadyAtRef.current = Date.now() + VAD_WARMUP_MS
 
     setIsActive(true)
     setVoiceStatus('listening')
