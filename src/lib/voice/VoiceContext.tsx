@@ -57,10 +57,10 @@ const DEAD_SIGNAL_MS    = 5000
 // перезахват — крайняя мера, не чаще раза в полминуты.
 const RECOVER_COOLDOWN_MS = 30000
 
-// Пауза после включения микрофона, прежде чем VAD получает право сработать.
-// В первые мгновения после переключения аудиосессии эхоподавление ещё не
-// сошлось, и звук собственной лекции из динамика прилетает на вход почти
-// без ослабления — в логе это пик 74 при пороге 42.
+// Пауза после включения микрофона, в течение которой НЕ считаем поток
+// оборванным. Аудиосессия в этот момент ещё перестраивается, и вход
+// закономерно молчит. Старт записи эта пауза не задерживает: иначе вопрос,
+// заданный сразу после нажатия кнопки, не проходил.
 const VAD_WARMUP_MS = 1800
 
 // Односэмпловый беззвучный WAV. Проигрывается по клику, чтобы «разблокировать»
@@ -258,6 +258,8 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     // микрофона вообще (главный симптом «кнопка мигает, но записи нет»).
     let peak = 0
     let lastReport = Date.now()
+    let maxFrames  = 0        // до скольки кадров подряд дошли за окно
+    let blockedBy  = ''       // почему при громком звуке не началась запись
 
     const tick = () => {
       if (!vadActiveRef.current) return
@@ -270,9 +272,18 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
 
       if (energy > peak) peak = energy
       if (Date.now() - lastReport > 3000) {
-        vlog(`VAD: пик ${peak.toFixed(1)} / порог ${VOICE_START_THRESHOLD}` +
-             `${peak < 1 ? ' — СИГНАЛА НЕТ' : peak < VOICE_START_THRESHOLD ? ' — слишком тихо' : ''}`)
+        let note = ''
+        if (peak < 1) note = ' — СИГНАЛА НЕТ'
+        else if (peak < VOICE_START_THRESHOLD) note = ' — слишком тихо'
+        // Громко говорили, а запись так и не началась — показываем причину,
+        // иначе такие случаи неотличимы от «микрофон не слышит»
+        else if (blockedBy) note = ` — запись заблокирована: ${blockedBy}`
+        else if (maxFrames > 0 && !isRecordingRef.current) note = ` — кадров подряд ${maxFrames}, нужно больше`
+
+        vlog(`VAD: пик ${peak.toFixed(1)} / порог ${VOICE_START_THRESHOLD}${note}`)
         peak = 0
+        maxFrames = 0
+        blockedBy = ''
         lastReport = Date.now()
       }
 
@@ -300,16 +311,24 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       }
 
       // ── Старт записи ──────────────────────────────────────────────────
-      // Во время речи ассистента запись разрешена — это перебивание, но с
-      // повышенной планкой, чтобы его собственный голос её не запускал.
-      // Во время лекции планка такая же: иначе её собственный звук из
-      // динамика запускает запись сам.
-      const framesNeeded = playingOut ? BARGE_IN_FRAMES : MIN_VOICE_FRAMES
-      const mayRecord    = warmedUp && !isRecordingRef.current && (!busyRef.current || speaking)
+      // Повышенная планка — только когда говорит сам ассистент: его голос
+      // идёт из того же динамика и иначе запускал бы запись сам.
+      //
+      // Во время ЛЕКЦИИ планку не поднимаем. Раньше поднимали, и вопрос
+      // поверх лекции перестал проходить: требовалось 18 кадров подряд выше
+      // порога, а речь между слогами проседает и счётчик обнуляется.
+      // Ложных срабатываний от самой лекции в логах при этом не было ни
+      // одного — её звук через эхоподавление даёт 18-26 против порога 42.
+      const framesNeeded = speaking ? BARGE_IN_FRAMES : MIN_VOICE_FRAMES
+      const mayRecord    = !isRecordingRef.current && (!busyRef.current || speaking)
 
       if (aboveStart) {
         voiceFramesRef.current++
-        if (voiceFramesRef.current >= framesNeeded && mayRecord) beginRecording()
+        if (voiceFramesRef.current > maxFrames) maxFrames = voiceFramesRef.current
+        if (voiceFramesRef.current >= framesNeeded) {
+          if (mayRecord) beginRecording()
+          else if (!isRecordingRef.current) blockedBy = busyRef.current ? 'занят обработкой' : 'идёт запись'
+        }
       } else {
         voiceFramesRef.current = 0
       }
