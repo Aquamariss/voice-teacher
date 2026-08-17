@@ -304,6 +304,43 @@ export default function AudioPlayer({ title, partLabel, text, onClose, onEnded }
     return () => { window.dispatchEvent(new CustomEvent('audio-player:close')) }
   }, [])
 
+  // Управление с экрана блокировки и с кнопки наушников.
+  // Для беспроводной гарнитуры это единственный способ поставить лекцию на
+  // паузу, не доставая телефон: сжатие ножки AirPods система отдаёт сюда как
+  // команду паузы.
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return
+    const ms = navigator.mediaSession
+
+    ms.metadata = new MediaMetadata({
+      title:  title,
+      artist: partLabel,
+      album:  'Голосовой учитель',
+    })
+
+    const onPlay  = () => {
+      userPausedRef.current = false
+      audioRef.current?.play().catch(() => {})
+    }
+    const onPause = () => {
+      userPausedRef.current = true
+      audioRef.current?.pause()
+    }
+
+    try {
+      ms.setActionHandler('play',  onPlay)
+      ms.setActionHandler('pause', onPause)
+    } catch { /* часть браузеров не знает этих действий */ }
+
+    return () => {
+      try {
+        ms.setActionHandler('play',  null)
+        ms.setActionHandler('pause', null)
+      } catch { /* см. выше */ }
+      ms.metadata = null
+    }
+  }, [title, partLabel])
+
   useEffect(() => {
     startStream()
 

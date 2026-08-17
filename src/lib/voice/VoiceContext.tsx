@@ -37,7 +37,11 @@ const VOICE_STOP_THRESHOLD  = 25  // ниже этого считаем, что 
 
 const SILENCE_MS       = 2200 // мс тишины перед отправкой (было 1400 — резало паузы в речи)
 const MIN_RECORD_MS    = 500  // мин. длина записи
-const MIN_VOICE_FRAMES = 8    // кадров подряд выше порога для старта записи (~130 мс)
+// Кадров подряд выше порога для старта записи. Всё, что прозвучало до этого
+// момента, теряется — MediaRecorder начинает писать только здесь. Снижено с 8
+// (~130 мс) до 3 (~50 мс): при 8 срезало первый слог, а ложных срабатываний
+// на этой планке нет — фоновый шум даёт 3-8 единиц против порога 42.
+const MIN_VOICE_FRAMES = 3
 // Перебивание ассистента: планка выше, чтобы его собственный голос из динамика
 // не запускал запись. Эхоподавление даёт 3-8 единиц, редкие всплески до 31.
 const BARGE_IN_FRAMES  = 18   // ~300 мс уверенной речи поверх ответа
@@ -500,6 +504,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       // busyRef остаётся true — его снимет TTS подтверждения.
       if (tokenMatchesRe(normalized, RESUME_RE)) {
         vlog('cmd: продолжить лекцию')
+        setVoiceStatus('processing')
         window.dispatchEvent(new CustomEvent('voice:say-and-resume', {
           detail: { text: 'Хорошо, продолжаю лекцию.' },
         }))

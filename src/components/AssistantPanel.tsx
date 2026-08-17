@@ -8,6 +8,7 @@ import { SPEEDS, SPEED_KEY, getSavedSpeed } from '@/lib/playback-speed'
 import { PartText } from '@/components/PartContent'
 import { getVoiceId } from '@/lib/voice/voiceSettings'
 import { vlog, verr } from '@/lib/voice/debugLog'
+import { SpeechQueue, takeCompleteSegments } from '@/lib/voice/SpeechQueue'
 import WikiCarousel, { type WikiImage } from '@/components/WikiCarousel'
 
 type Role       = 'user' | 'assistant'
@@ -119,8 +120,7 @@ export default function AssistantPanel() {
   const editContextRef     = useRef<{ discipline: Discipline; topics: Topic[] } | null>(null)
   const topicCtxRef        = useRef<TopicStructureCtx | null>(null)
   const modeRef        = useRef<PanelMode>('assistant')
-  const assistAudioRef  = useRef<HTMLAudioElement | null>(null)
-  const ttsBlobUrlRef   = useRef<string | null>(null)
+  const speechRef       = useRef<SpeechQueue | null>(null)
   // Tracks the currently viewed lesson (for quiz context)
   const activeLessonIdRef = useRef<string | null>(null)
 
@@ -204,90 +204,63 @@ export default function AssistantPanel() {
   // ── TTS ───────────────────────────────────────────────────────────────────────
 
   function stopAssistantAudio() {
-    const audio = assistAudioRef.current
-    if (audio) {
-      audio.onended = null
-      audio.onerror = null
-      audio.pause()
-      // src НЕ очищаем: элемент переиспользуется и очистка сбрасывает
-      // разблокировку автовоспроизведения на iOS
-      assistAudioRef.current = null
-    }
-    if (ttsBlobUrlRef.current) {
-      URL.revokeObjectURL(ttsBlobUrlRef.current)
-      ttsBlobUrlRef.current = null
-    }
+    speechRef.current?.cancel()
+    speechRef.current = null
   }
 
-  // onComplete вызывается ровно один раз на любом исходе — в том числе при
-  // ошибке сети и отказе воспроизведения. От него зависит возобновление
-  // лекции после подтверждения, поэтому потерять его нельзя.
-  async function playAssistantTTS(text: string, onComplete?: () => void) {
+  async function fetchTTS(text: string): Promise<Blob | null> {
+    vlog(`tts: запрос, ${text.length} символов`)
+    const res = await fetch('/api/tts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voiceId: getVoiceId() }),
+    })
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      verr(`tts: HTTP ${res.status}`, body.slice(0, 200))
+      return null
+    }
+    const blob = await res.blob()
+    vlog(`tts: получено ${blob.size} байт`)
+    return blob
+  }
+
+  // Общая очередь для обоих режимов: потокового (сегменты по мере генерации)
+  // и разового (одна фраза целиком).
+  // onComplete вызывается ровно один раз на любом исходе, включая ошибку сети
+  // и отказ воспроизведения — от него зависит возобновление лекции после
+  // подтверждения, потерять его нельзя.
+  function startSpeech(onComplete?: () => void): SpeechQueue | null {
     let completed = false
     const complete = () => { if (!completed) { completed = true; onComplete?.() } }
 
-    if (!voice.isActive) { complete(); return }
+    if (!voice.isActive) { complete(); return null }
+
     stopAssistantAudio()
     voice.setBusy(true)
-    voice.setVoiceStatus('speaking')
 
-    try {
-      vlog(`tts: запрос, ${text.length} символов`)
-      const res = await fetch('/api/tts', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voiceId: getVoiceId() }),
-      })
-      if (!res.ok) {
-        const body = await res.text().catch(() => '')
-        verr(`tts: HTTP ${res.status}`, body.slice(0, 200))
+    const queue = new SpeechQueue({
+      getAudio:   () => voice.getPlaybackAudio(),
+      fetchAudio: fetchTTS,
+      getSpeed:   getSavedSpeed,
+      // «Говорю» — только когда звук реально пошёл. Пока модель генерирует,
+      // статус остаётся «Думаю», иначе индикатор врёт несколько секунд
+      onFirstSound: () => voice.setVoiceStatus('speaking'),
+      onDone: () => {
+        if (speechRef.current === queue) speechRef.current = null
         voice.setBusy(false)
         complete()
-        return
-      }
-      if (!voice.isActive) { voice.setBusy(false); complete(); return }
+      },
+    })
+    speechRef.current = queue
+    return queue
+  }
 
-      const blob = await res.blob()
-      vlog(`tts: получено ${blob.size} байт, ${blob.type}`)
-      if (!voice.isActive) { voice.setBusy(false); complete(); return }
-
-      const url = URL.createObjectURL(blob)
-      ttsBlobUrlRef.current = url
-
-      // Переиспользуем элемент, разблокированный жестом при включении микрофона:
-      // на iOS play() из async-кода разрешён только для уже разблокированного элемента.
-      const audio = voice.getPlaybackAudio() ?? new Audio()
-      assistAudioRef.current = audio
-
-      const onDone = () => {
-        if (ttsBlobUrlRef.current) { URL.revokeObjectURL(ttsBlobUrlRef.current); ttsBlobUrlRef.current = null }
-        assistAudioRef.current = null
-        voice.setBusy(false)
-        complete()
-      }
-      audio.onended = onDone
-      audio.onerror = () => {
-        verr('tts: ошибка элемента', audio.error ? `code=${audio.error.code} ${audio.error.message}` : 'unknown')
-        onDone()
-      }
-
-      // src меняем без load() — load() сбрасывает разблокировку на iOS
-      audio.src = url
-      audio.playbackRate = getSavedSpeed()
-
-      try {
-        await audio.play()
-        audio.playbackRate = getSavedSpeed()  // некоторые браузеры сбрасывают при смене src
-        vlog('tts: воспроизводится')
-      } catch (e) {
-        const err = e as Error
-        verr(`tts: play() отклонён (${err.name})`, err.message)
-        onDone()
-      }
-    } catch (e) {
-      verr('tts: исключение', e)
-      voice.setBusy(false)
-      complete()
-    }
+  /** Разовая озвучка готового текста. */
+  function playAssistantTTS(text: string, onComplete?: () => void) {
+    const queue = startSpeech(onComplete)
+    if (!queue) return
+    queue.push(text)
+    queue.end()
   }
 
   useEffect(() => {
@@ -321,11 +294,14 @@ export default function AssistantPanel() {
       const next = SPEEDS[newIdx]
       if (next === cur) return
       localStorage.setItem(SPEED_KEY, String(next))
-      if (assistAudioRef.current) assistAudioRef.current.playbackRate = next
+      // Очередь читает скорость через getSpeed() на каждом сегменте, но
+      // текущий уже играет — ему меняем на месте
+      const audio = voice.getPlaybackAudio()
+      if (audio) audio.playbackRate = next
     }
     window.addEventListener('voice:change-speed', handle)
     return () => window.removeEventListener('voice:change-speed', handle)
-  }, [])
+  }, [voice])
 
   // ── Discipline creation mode ───────────────────────────────────────────────────
 
@@ -796,6 +772,29 @@ export default function AssistantPanel() {
       const decoder = new TextDecoder()
       let buffer = '', fullText = ''
 
+      // Потоковая озвучка: первое законченное предложение уходит на синтез
+      // сразу, не дожидаясь конца ответа. Это снимает основную часть паузы
+      // между вопросом и первым звуком.
+      const speech    = voice.isActive ? startSpeech() : null
+      let speechBuf   = ''   // ещё не нарезанный хвост
+      let spokeAny    = false
+      let speechStopped = false   // встретили маркер JSON — дальше не озвучиваем
+
+      const feedSpeech = (chunk: string) => {
+        if (!speech || speechStopped) return
+        speechBuf += chunk
+        // JSON-блок агента не должен попасть в озвучку
+        const markerAt = speechBuf.search(/СТРУКТУРА_ГОТОВА:|ИЗМЕНЕНИЯ_ГОТОВЫ:|СТРУКТУРА_ТЕМЫ_ГОТОВА:/)
+        if (markerAt !== -1) {
+          speechBuf = speechBuf.slice(0, markerAt)
+          speechStopped = true
+        }
+        const { segments, rest } = takeCompleteSegments(speechBuf, !spokeAny)
+        for (const s of segments) { speech.push(s); spokeAny = true }
+        speechBuf = rest
+        if (speechStopped) { speech.push(speechBuf); speechBuf = ''; speech.end() }
+      }
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
@@ -815,6 +814,7 @@ export default function AssistantPanel() {
 
           if (event === 'text') {
             fullText += data.text
+            feedSpeech(data.text)
             setMessages(prev => {
               const u = [...prev]
               u[u.length - 1] = { role: 'assistant', content: fullText }
@@ -853,14 +853,20 @@ export default function AssistantPanel() {
         return u
       })
 
-      if (voice.isActive && fullText) playAssistantTTS(fullText)
-      else voice.setBusy(false)
+      // Договариваем хвост, не дотянувший до конца предложения, и закрываем
+      // очередь — onDone внутри неё снимет busy, когда всё отзвучит
+      if (speech) {
+        if (!speechStopped) { if (speechBuf.trim()) speech.push(speechBuf); speech.end() }
+      } else {
+        voice.setBusy(false)
+      }
     } catch {
       setMessages(prev => {
         const u = [...prev]
         u[u.length - 1] = { role: 'assistant', content: 'Что-то пошло не так. Попробуй ещё раз.' }
         return u
       })
+      stopAssistantAudio()
       voice.setBusy(false)
     } finally {
       setLoading(false)
